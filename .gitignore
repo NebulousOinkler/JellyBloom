@@ -1,0 +1,4 @@
+/bin/
+config.yaml
+*.test
+.DS_Store
