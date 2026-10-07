@@ -1,20 +1,62 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/NebulousOinkler/JellyBloom/internal/config"
+	"github.com/NebulousOinkler/JellyBloom/internal/index"
+	"github.com/NebulousOinkler/JellyBloom/internal/upstream"
 )
 
 func main() {
 	path := flag.String("config", "config.yaml", "path to config file")
 	flag.Parse()
 
-	cfg, err := config.Load(*path)
+	if err := run(*path); err != nil {
+		slog.Error("fatal", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run(configPath string) error {
+	cfg, err := config.Load(configPath)
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return err
+	}
+	store, err := index.Open(filepath.Join(cfg.DataDir, "jellybloom.db"))
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	var wg sync.WaitGroup
+	for _, u := range cfg.Upstreams {
+		client, err := upstream.New(u, upstream.Options{})
+		if err != nil {
+			return err
+		}
+		syncer := index.NewSyncer(store, client, index.SyncerOptions{})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			syncer.Run(ctx)
+		}()
 	}
 
 	mux := http.NewServeMux()
@@ -22,7 +64,18 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"ServerName":"` + cfg.ServerName + `","ProductName":"JellyBloom"}`))
 	})
+	srv := &http.Server{Addr: cfg.Listen, Handler: mux}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		srv.Shutdown(shutdownCtx)
+	}()
 
-	log.Printf("JellyBloom listening on %s with %d upstreams (%s)", cfg.Listen, len(cfg.Upstreams), cfg.Merge)
-	log.Fatal(http.ListenAndServe(cfg.Listen, mux))
+	slog.Info("JellyBloom listening", "addr", cfg.Listen, "upstreams", len(cfg.Upstreams), "merge", cfg.Merge)
+	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	wg.Wait()
+	return nil
 }

@@ -22,11 +22,13 @@ with the "done when" check from that table. Target upstream version: Jellyfin 10
 - [x] Tests against a fake Jellyfin (`httptest`) covering all of the above
 
 ## Phase 2: Index and sync (`internal/index`)
-- [ ] SQLite schema: `upstream_items(upstream, real_id, type, parent_id, dto_json, etag, synced_at)`
-- [ ] Full sync per upstream into a staging generation, then an atomic swap
-- [ ] Incremental sync from `LibraryChanged` (add, update, remove)
-- [ ] Periodic resync and a per-upstream sync status
-- [ ] Startup: serve the last good index while a resync runs
+- [x] SQLite schema (`items`, `views`, `item_views`, `sync_state`), pure-Go driver, WAL
+- [x] Full sync per upstream into a staging generation, then an atomic swap
+- [x] Incremental sync from `LibraryChanged` (add, update, remove)
+- [x] Periodic resync and a per-upstream sync status
+- [x] Startup: serve the last good index while a resync runs
+- Known gap: a music artist changed between full syncs is re-indexed without its library
+  link until the next full sync (artists are outside the `/Items` tree)
 
 ## Phase 3: Identity (`internal/identity`)
 - [ ] Match-key registry per item type: movie, series, season, episode, artist, album, track, fallback

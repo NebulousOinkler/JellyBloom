@@ -149,6 +149,23 @@ func TestEachItemPage(t *testing.T) {
 	}
 }
 
+func TestEachArtistPage(t *testing.T) {
+	f := newFake(t)
+	c := f.client(t, config.Upstream{Username: "me", Password: "pw"})
+
+	items := 0
+	err := c.EachArtistPage(testCtx(t), ItemsQuery{ParentID: "lib-music"}, 20, func(p *QueryResult) error {
+		items += len(p.Items)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if items != 25 || f.query("parentId") != "lib-music" {
+		t.Errorf("items=%d parentId=%q", items, f.query("parentId"))
+	}
+}
+
 func TestEachItemPageStopsOnCallbackError(t *testing.T) {
 	f := newFake(t)
 	c := f.client(t, config.Upstream{Username: "me", Password: "pw"})

@@ -1,6 +1,9 @@
 listen: ":8096"
 server_name: "JellyBloom"
 
+# Holds the metadata index (jellybloom.db). Never contains media or other upstream files.
+data_dir: data
+
 # How results from multiple upstreams are combined: union | intersection | difference
 merge: union
 

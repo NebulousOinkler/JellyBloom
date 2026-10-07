@@ -22,6 +22,7 @@ type Config struct {
 	ServerName  string     `yaml:"server_name"`
 	Merge       string     `yaml:"merge"`
 	WebUpstream string     `yaml:"web_upstream"`
+	DataDir     string     `yaml:"data_dir"`
 	Upstreams   []Upstream `yaml:"upstreams"`
 }
 
@@ -30,7 +31,7 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &Config{Listen: ":8096", ServerName: "JellyBloom", Merge: "union"}
+	c := &Config{Listen: ":8096", ServerName: "JellyBloom", Merge: "union", DataDir: "data"}
 	if err := yaml.Unmarshal(b, c); err != nil {
 		return nil, err
 	}

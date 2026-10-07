@@ -64,6 +64,7 @@ func newFake(t *testing.T) *fakeJellyfin {
 	mux.HandleFunc("GET /Users", f.auth(f.listUsers))
 	mux.HandleFunc("GET /UserViews", f.auth(f.views))
 	mux.HandleFunc("GET /Items", f.auth(f.itemsHandler))
+	mux.HandleFunc("GET /Artists", f.auth(f.itemsHandler))
 	mux.HandleFunc("GET /socket", f.socket)
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)

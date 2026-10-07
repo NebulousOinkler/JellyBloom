@@ -117,11 +117,21 @@ func (c *Client) Views(ctx context.Context) (*QueryResult, error) {
 
 // Items runs one /Items query as the upstream user.
 func (c *Client) Items(ctx context.Context, q ItemsQuery) (*QueryResult, error) {
+	return c.query(ctx, "/Items", q)
+}
+
+// Artists runs one /Artists query. Music artists are not children of the
+// library tree, so recursive /Items listings do not include them.
+func (c *Client) Artists(ctx context.Context, q ItemsQuery) (*QueryResult, error) {
+	return c.query(ctx, "/Artists", q)
+}
+
+func (c *Client) query(ctx context.Context, path string, q ItemsQuery) (*QueryResult, error) {
 	if err := c.ensureLogin(ctx, ""); err != nil {
 		return nil, err
 	}
 	var res QueryResult
-	if err := c.get(ctx, "/Items", q.values(c.UserID()), &res); err != nil {
+	if err := c.get(ctx, path, q.values(c.UserID()), &res); err != nil {
 		return nil, err
 	}
 	return &res, nil
@@ -131,12 +141,21 @@ func (c *Client) Items(ctx context.Context, q ItemsQuery) (*QueryResult, error) 
 // is the starting offset and pageSize replaces q.Limit. It stops when fn returns
 // an error, the upstream returns an empty page, or TotalRecordCount is reached.
 func (c *Client) EachItemPage(ctx context.Context, q ItemsQuery, pageSize int, fn func(*QueryResult) error) error {
+	return c.eachPage(ctx, "/Items", q, pageSize, fn)
+}
+
+// EachArtistPage is EachItemPage over /Artists.
+func (c *Client) EachArtistPage(ctx context.Context, q ItemsQuery, pageSize int, fn func(*QueryResult) error) error {
+	return c.eachPage(ctx, "/Artists", q, pageSize, fn)
+}
+
+func (c *Client) eachPage(ctx context.Context, path string, q ItemsQuery, pageSize int, fn func(*QueryResult) error) error {
 	if pageSize <= 0 {
 		pageSize = 500
 	}
 	q.Limit = pageSize
 	for {
-		page, err := c.Items(ctx, q)
+		page, err := c.query(ctx, path, q)
 		if err != nil {
 			return err
 		}

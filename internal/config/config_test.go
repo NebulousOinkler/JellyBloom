@@ -25,7 +25,7 @@ upstreams:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Listen != ":8096" || c.ServerName != "JellyBloom" || c.Merge != "union" || c.WebUpstream != "home" {
+	if c.Listen != ":8096" || c.ServerName != "JellyBloom" || c.Merge != "union" || c.WebUpstream != "home" || c.DataDir != "data" {
 		t.Errorf("defaults = %+v", c)
 	}
 }
