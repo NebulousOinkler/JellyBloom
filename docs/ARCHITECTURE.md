@@ -17,6 +17,35 @@ Every client request takes one of four paths:
 
 The client only ever sees JellyBloom's host, IDs, and tokens.
 
+## Invariant: no local storage of upstream files
+
+JellyBloom is a pure proxy. It never writes upstream files to disk: no media, no
+segments, no subtitles, no artwork.
+
+| JellyBloom persists | JellyBloom never persists |
+|---------------------|---------------------------|
+| Item metadata (DTO JSON) in the index | Video and audio files, or any part of them |
+| ID mappings | HLS playlists and segments |
+| Version digests (partial content hashes) | Subtitle files |
+| JellyBloom's own users, tokens, user data, playlists | Images and artwork |
+| Source health and throughput stats | Transcode output |
+
+Rules for implementation:
+- **Relays stream from memory.** Upstream bodies are copied to the client through a fixed,
+  bounded buffer (`io.CopyBuffer`), with no temp files and no spooling. Failover reissues a
+  `Range` request to the next source instead of replaying buffered data.
+- **Rewritten text** (JSON, m3u8, HTML, JS) is rewritten in memory per response, and
+  never cached on disk.
+- **Hashing streams through.** Partial content hashes read the bytes through the hash
+  function and keep only the digest.
+- **Caching is delegated to clients.** Upstream `Cache-Control`, `ETag`, and
+  `Last-Modified` headers pass through, so clients and browsers cache artwork themselves.
+  `ImageTags` already change whenever an image changes.
+- **Enforcement:** a test runs the full integration suite with JellyBloom's data directory
+  inspected afterwards. It may contain only the SQLite database and no files larger than
+  the database's expected size. CI also fails on `os.Create`, `os.CreateTemp`, or
+  `os.WriteFile` outside the store package.
+
 ## Core concepts
 
 ### Upstream sessions
@@ -73,7 +102,8 @@ files, and keeping items available when an upstream is down.
 **Versions vs. sources.** Copies are grouped in two levels:
 - A **version** is a distinct encode. Two copies are the same encode when they match on
   container, codecs, resolution, bitrate, runtime, and file size, plus a partial content
-  hash (first and last few MB, fetched lazily with Range requests).
+  hash (first and last few MB, fetched lazily with Range requests and streamed through the
+  hash; only the digest is stored).
 - A **source** is one location of a version: `(upstream, realItemId, realMediaSourceId)`.
 
 `PlaybackInfo` shows the client one `MediaSource` per **version**, so clients display
@@ -209,7 +239,7 @@ injected plugin scripts and config pages.
 | 6 | **Playback** | `PlaybackInfo` merge with **version/source grouping**, source ranking, **active-source tracking**, direct-play relay, HLS rewriting, `PlaySessionId` routing, progress forwarding | Video and music play and seek; duplicate encodes show as one version; transcodes are cleaned up on stop |
 | 7 | **User state** | Played, favorites, resume, next-up, playlists, collections | State persists across upstreams and devices |
 | 8 | **Redundancy** | Partial content hashing, throughput and latency stats, byte-level failover, HLS failover, health tracking and quarantine, redundancy report | Killing an upstream or corrupting a file mid-play continues playback from another copy |
-| 9 | **Set operations and hardening** | Intersection and difference, image cache, timeouts, partial-failure handling, metrics, Dockerfile | All set operations pass integration tests; upstream outages degrade gracefully |
+| 9 | **Set operations and hardening** | Intersection and difference, cache-header pass-through, no-local-storage enforcement test, timeouts, partial-failure handling, metrics, Dockerfile | All set operations pass integration tests; upstream outages degrade gracefully |
 
 ### Testing
 - **Unit tests:** match keys, ID mapping, set operations, GUID and URL rewriter, HLS
