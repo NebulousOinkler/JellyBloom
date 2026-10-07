@@ -7,6 +7,10 @@ data_dir: data
 # How results from multiple upstreams are combined: union | intersection | difference
 merge: union
 
+# difference only: show items on `base` that are on none of the `subtract` upstreams.
+# base: home
+# subtract: [friend]
+
 # Upstream that serves the stock jellyfin-web UI at /web (default: first upstream)
 web_upstream: home
 

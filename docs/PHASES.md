@@ -31,13 +31,20 @@ with the "done when" check from that table. Target upstream version: Jellyfin 10
   link until the next full sync (artists are outside the `/Items` tree)
 
 ## Phase 3: Identity (`internal/identity`)
-- [ ] Match-key registry per item type: movie, series, season, episode, artist, album, track, fallback
-- [ ] UUIDv5 unified IDs in Jellyfin's 32-hex format
-- [ ] Mapping table: unified ID ↔ every `(upstream, realId)`, plus lazy mappings
-- [ ] Hierarchy remap: `ParentId`, `SeriesId`, `SeasonId`, `AlbumId`, artists
-- [ ] Set-operation engine: `union`, `intersection`, `difference` (`base` \ `subtract`)
-- [ ] Config: `base` and `subtract` keys, validated
-- [ ] Table-driven tests for all set operations
+- [x] Match-key registry per item type: movie, series, season, episode, artist, album, track, fallback
+- [x] UUIDv5 unified IDs in Jellyfin's 32-hex format
+- [x] Mapping table: unified ID ↔ every `(upstream, realId)`, plus lazy mappings
+- [x] Hierarchy remap: `ParentId`, `SeriesId`, `SeasonId`, `AlbumId`, artists
+- [x] Set-operation engine: `union`, `intersection`, `difference` (`base` \ `subtract`)
+- [x] Config: `base` and `subtract` keys, validated
+- [x] Table-driven tests for all set operations
+- Matching: items carry several strong keys (provider IDs) and one weak key (normalized
+  title/year, or parent + index). Shared strong keys always merge; weak keys merge only
+  when no provider IDs conflict.
+- Stability: every key remembers its unified ID, so IDs survive new copies, resyncs, and
+  remove/re-add. Groups bridged by a new copy keep one ID and redirect the other.
+- Set operations apply to leaves (movies, episodes, tracks…); containers are visible when
+  any child is, so `difference` never hides an a-only episode behind a shared series.
 
 ## Phase 4: Server skeleton and generic routing (`internal/server`, `internal/rewrite`)
 - [ ] Case-insensitive router

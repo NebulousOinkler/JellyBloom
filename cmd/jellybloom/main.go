@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/NebulousOinkler/JellyBloom/internal/config"
+	"github.com/NebulousOinkler/JellyBloom/internal/identity"
 	"github.com/NebulousOinkler/JellyBloom/internal/index"
 	"github.com/NebulousOinkler/JellyBloom/internal/upstream"
 )
@@ -45,13 +46,32 @@ func run(configPath string) error {
 	}
 	defer store.Close()
 
+	var names []string
+	for _, u := range cfg.Upstreams {
+		names = append(names, u.Name)
+	}
+	resolver, err := identity.New(store, identity.Mode{
+		Op:        identity.Op(cfg.Merge),
+		Upstreams: names,
+		Base:      cfg.Base,
+		Subtract:  cfg.Subtract,
+	}, nil)
+	if err != nil {
+		return err
+	}
+
 	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resolver.Run(ctx, time.Second)
+	}()
 	for _, u := range cfg.Upstreams {
 		client, err := upstream.New(u, upstream.Options{})
 		if err != nil {
 			return err
 		}
-		syncer := index.NewSyncer(store, client, index.SyncerOptions{})
+		syncer := index.NewSyncer(store, client, index.SyncerOptions{OnChange: resolver.Notify})
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

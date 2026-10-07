@@ -21,6 +21,8 @@ type Config struct {
 	Listen      string     `yaml:"listen"`
 	ServerName  string     `yaml:"server_name"`
 	Merge       string     `yaml:"merge"`
+	Base        string     `yaml:"base"`     // difference: A in A \ B
+	Subtract    []string   `yaml:"subtract"` // difference: B (one or more upstreams)
 	WebUpstream string     `yaml:"web_upstream"`
 	DataDir     string     `yaml:"data_dir"`
 	Upstreams   []Upstream `yaml:"upstreams"`
@@ -58,6 +60,24 @@ func Load(path string) (*Config, error) {
 		if u.APIKey != "" && u.User == "" {
 			return nil, fmt.Errorf("upstream %q: api_key requires user", u.Name)
 		}
+	}
+	if c.Merge == "difference" {
+		if !names[c.Base] {
+			return nil, fmt.Errorf("difference: base %q is not a configured upstream", c.Base)
+		}
+		if len(c.Subtract) == 0 {
+			return nil, fmt.Errorf("difference: subtract must list at least one upstream")
+		}
+		for _, n := range c.Subtract {
+			if !names[n] {
+				return nil, fmt.Errorf("difference: subtract %q is not a configured upstream", n)
+			}
+			if n == c.Base {
+				return nil, fmt.Errorf("difference: %q cannot be both base and subtract", n)
+			}
+		}
+	} else if c.Base != "" || len(c.Subtract) > 0 {
+		return nil, fmt.Errorf("base and subtract only apply to merge: difference")
 	}
 	if c.WebUpstream == "" {
 		c.WebUpstream = c.Upstreams[0].Name

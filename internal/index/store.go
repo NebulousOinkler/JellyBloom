@@ -83,6 +83,31 @@ func Open(path string) (*Store, error) {
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 
+// DB exposes the database so other packages can keep their tables alongside
+// the index (e.g. identity mappings).
+func (s *Store) DB() *sql.DB { return s.db }
+
+// EachItem calls fn for every indexed item of every upstream, ordered by
+// upstream then ID.
+func (s *Store) EachItem(ctx context.Context, fn func(upstream string, dto json.RawMessage) error) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT upstream, dto FROM items ORDER BY upstream, real_id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var up string
+		var dto []byte
+		if err := rows.Scan(&up, &dto); err != nil {
+			return err
+		}
+		if err := fn(up, dto); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 // Item is one indexed upstream item.
 type Item struct {
 	Upstream string

@@ -43,6 +43,7 @@ type SyncerOptions struct {
 	ResyncInterval time.Duration // periodic full sync; default 6h
 	Debounce       time.Duration // window for coalescing LibraryChanged bursts; default 2s
 	RetryMin       time.Duration // first retry after a failed full sync; default 30s
+	OnChange       func()        // called after each committed full or incremental sync
 	Logger         *slog.Logger
 }
 
@@ -80,6 +81,9 @@ func NewSyncer(store *Store, src Source, opts SyncerOptions) *Syncer {
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
+	}
+	if opts.OnChange == nil {
+		opts.OnChange = func() {}
 	}
 	return &Syncer{
 		store:   store,
@@ -247,6 +251,7 @@ func (s *Syncer) FullSync(ctx context.Context) (err error) {
 	if err := fs.Commit(ctx); err != nil {
 		return err
 	}
+	s.opts.OnChange()
 	s.log.Info("full sync complete", "views", len(headers), "items", items, "took", time.Since(start).Round(time.Millisecond))
 	return nil
 }
@@ -336,6 +341,7 @@ func (s *Syncer) applyChanges(ctx context.Context, pending map[string]bool) erro
 	if err := s.store.ApplyChanges(ctx, s.src.Name(), upserts, removed); err != nil {
 		return err
 	}
+	s.opts.OnChange()
 	s.log.Debug("incremental sync applied", "upserted", len(upsertIDs), "removed", len(removed))
 	return nil
 }
