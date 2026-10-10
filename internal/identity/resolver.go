@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS lazy_mappings (
 	real_id    TEXT NOT NULL,
 	unified_id TEXT NOT NULL,
 	rank       INTEGER NOT NULL DEFAULT 0,
-	alias      INTEGER NOT NULL DEFAULT 0, -- set by SetAliases; 0 when minted
+	alias      INTEGER NOT NULL DEFAULT 0, -- 0 minted, 1 alias, 2 play session alias
+	created    INTEGER NOT NULL DEFAULT 0, -- unix ms, set by SetAliases
 	PRIMARY KEY (upstream, real_id)
 );
 CREATE INDEX IF NOT EXISTS lazy_mappings_unified ON lazy_mappings (unified_id, rank);
@@ -105,14 +106,16 @@ func New(idx *index.Store, mode Mode, logger *slog.Logger) (*Resolver, error) {
 	if _, err := idx.DB().Exec(schema); err != nil {
 		return nil, fmt.Errorf("identity: init schema: %w", err)
 	}
-	// Added after the first release.
-	var hasAlias bool
-	if err := idx.DB().QueryRow(`SELECT COUNT(*) > 0 FROM pragma_table_info('lazy_mappings') WHERE name = 'alias'`).Scan(&hasAlias); err != nil {
-		return nil, fmt.Errorf("identity: init schema: %w", err)
-	}
-	if !hasAlias {
-		if _, err := idx.DB().Exec(`ALTER TABLE lazy_mappings ADD COLUMN alias INTEGER NOT NULL DEFAULT 0`); err != nil {
+	// Columns added after the first release.
+	for _, col := range []string{"alias", "created"} {
+		var has bool
+		if err := idx.DB().QueryRow(`SELECT COUNT(*) > 0 FROM pragma_table_info('lazy_mappings') WHERE name = ?`, col).Scan(&has); err != nil {
 			return nil, fmt.Errorf("identity: init schema: %w", err)
+		}
+		if !has {
+			if _, err := idx.DB().Exec(`ALTER TABLE lazy_mappings ADD COLUMN ` + col + ` INTEGER NOT NULL DEFAULT 0`); err != nil {
+				return nil, fmt.Errorf("identity: init schema: %w", err)
+			}
 		}
 	}
 	return &Resolver{idx: idx, db: idx.DB(), mode: mode, log: logger, notify: make(chan struct{}, 1)}, nil
@@ -145,6 +148,11 @@ func (r *Resolver) Run(ctx context.Context, debounce time.Duration) error {
 		}
 		if _, err := r.Rebuild(ctx); err != nil && ctx.Err() == nil {
 			r.log.Error("identity rebuild failed", "err", err)
+		}
+		if n, err := r.PruneSessions(ctx, time.Now().Add(-SessionAliasTTL)); err != nil && ctx.Err() == nil {
+			r.log.Error("pruning play session aliases failed", "err", err)
+		} else if n > 0 {
+			r.log.Debug("pruned play session aliases", "rows", n)
 		}
 	}
 }
@@ -736,11 +744,11 @@ func (r *Resolver) Lookup(ctx context.Context, id string) (*Unified, error) {
 		u.Minted = true
 		for rows.Next() {
 			rf := Ref{Source: true}
-			var alias bool
+			var alias int
 			if err := rows.Scan(&rf.Upstream, &rf.ID, &alias); err != nil {
 				return nil, err
 			}
-			u.Minted = u.Minted && !alias
+			u.Minted = u.Minted && alias == 0
 			u.Refs = append(u.Refs, rf)
 		}
 		if err := rows.Err(); err != nil {
@@ -802,7 +810,13 @@ func (r *Resolver) UnifiedID(ctx context.Context, upstream, realID string) (stri
 type Alias struct {
 	ID   string
 	Refs []Ref // routing preference order
+	// Session marks a play session's alias: it is pruned after
+	// SessionAliasTTL, while other aliases last until replaced.
+	Session bool
 }
+
+// SessionAliasTTL is how long play session aliases are kept.
+const SessionAliasTTL = 7 * 24 * time.Hour
 
 // SetAliases records aliases, replacing earlier mappings of the same
 // synthesized IDs or upstream objects.
@@ -817,8 +831,9 @@ func (r *Resolver) SetAliases(ctx context.Context, aliases []Alias) error {
 		return err
 	}
 	defer delID.Close()
-	upsert, err := tx.PrepareContext(ctx, `INSERT INTO lazy_mappings (upstream, real_id, unified_id, rank, alias) VALUES (?, ?, ?, ?, 1)
-		ON CONFLICT (upstream, real_id) DO UPDATE SET unified_id = excluded.unified_id, rank = excluded.rank, alias = 1`)
+	upsert, err := tx.PrepareContext(ctx, `INSERT INTO lazy_mappings (upstream, real_id, unified_id, rank, alias, created) VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT (upstream, real_id) DO UPDATE SET unified_id = excluded.unified_id, rank = excluded.rank,
+		alias = excluded.alias, created = excluded.created`)
 	if err != nil {
 		return err
 	}
@@ -827,13 +842,26 @@ func (r *Resolver) SetAliases(ctx context.Context, aliases []Alias) error {
 		if _, err := delID.ExecContext(ctx, a.ID); err != nil {
 			return err
 		}
+		kind := 1
+		if a.Session {
+			kind = 2
+		}
 		for i, rf := range a.Refs {
-			if _, err := upsert.ExecContext(ctx, rf.Upstream, NormalizeID(rf.ID), a.ID, i); err != nil {
+			if _, err := upsert.ExecContext(ctx, rf.Upstream, NormalizeID(rf.ID), a.ID, i, kind, time.Now().UnixMilli()); err != nil {
 				return err
 			}
 		}
 	}
 	return tx.Commit()
+}
+
+// PruneSessions forgets play session aliases set before cutoff.
+func (r *Resolver) PruneSessions(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := r.db.ExecContext(ctx, `DELETE FROM lazy_mappings WHERE alias = 2 AND created < ?`, cutoff.UnixMilli())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // CopyDTO is one source copy of a unified item with its indexed DTO.

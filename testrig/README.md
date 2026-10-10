@@ -23,6 +23,7 @@ testrig/servers.sh restart-jb  # pick up the generated config / rebuilt code
 testrig/smoke.py               # drive JellyBloom like a client; PASS/FAIL per check
 testrig/compare.py             # same user-state steps on real Jellyfin and JellyBloom; diff
 testrig/failover.py            # copy checks, ranking, and failover under injected faults
+testrig/setops.py              # intersection, a \ b, b \ a instances checked against the servers
 testrig/servers.sh stop-server b   # simulate an upstream outage (start-server b to recover)
 testrig/servers.sh faults a '{"cut_after": 30000000}'   # inject faults on a (clear: faults a clear)
 testrig/servers.sh stop
@@ -49,6 +50,10 @@ faults and counters; give it JSON to set faults (omitted fields are cleared) or 
 | `cut_after` | media bodies break off after this many bytes |
 | `stall_after` | media bodies stop sending after this many bytes |
 | `status` | media requests get this HTTP status |
+
+JellyBloom's metrics are at http://127.0.0.1:8209/metrics. `setops.py` starts its extra
+instances on :8301 to :8303 with copies of the main instance's pairing, under
+`testrig/data/setops/`, and stops them when done.
 
 Media requests are file streams, downloads, and HLS. The rig config sets `stall_timeout: 3s`
 so stalls fail over quickly, and makes the rig user a JellyBloom admin, so

@@ -463,7 +463,7 @@ func (h *Handler) respond(w http.ResponseWriter, r *http.Request, c proxy.Caller
 		aliases = append(aliases, a)
 	}
 	psid := newPlaySessionID()
-	ps := identity.Alias{ID: psid}
+	ps := identity.Alias{ID: psid, Session: true}
 	for _, a := range answers {
 		if a.psid != "" {
 			ps.Refs = append(ps.Refs, identity.Ref{Upstream: a.up, ID: a.psid})

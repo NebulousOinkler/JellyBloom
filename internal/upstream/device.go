@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Device is a client device JellyBloom acts for on an upstream. Giving each
@@ -30,9 +31,19 @@ func DeviceID(upstream, userID, clientDeviceID string) string {
 }
 
 type deviceSession struct {
-	mu    sync.Mutex
-	token string
+	mu      sync.Mutex
+	token   string
+	retryAt time.Time // minting failed: share JellyBloom's session until then
 }
+
+var (
+	// mintTimeout bounds giving a device its own session, so a hung
+	// upstream cannot hold up a client's requests for long.
+	mintTimeout = 10 * time.Second
+	// mintRetry is how long a device shares JellyBloom's session after
+	// minting failed, before trying again.
+	mintRetry = time.Minute
+)
 
 func quoteParam(v string) string { return strings.ReplaceAll(v, `"`, "") }
 
@@ -92,7 +103,12 @@ func (c *Client) DeviceToken(ctx context.Context, d Device) (token string, perDe
 	if ds.token != "" {
 		return ds.token, true, nil
 	}
-	tok, err := c.mintDevice(ctx, d, root, uid)
+	if time.Now().Before(ds.retryAt) {
+		return root, false, nil
+	}
+	mctx, cancel := context.WithTimeout(ctx, mintTimeout)
+	defer cancel()
+	tok, err := c.mintDevice(mctx, d, root, uid)
 	if isUnauthorized(err) {
 		// Our own session was rejected (e.g. revoked upstream): re-establish
 		// it, which reports a CredentialError if re-pairing is needed.
@@ -100,12 +116,18 @@ func (c *Client) DeviceToken(ctx context.Context, d Device) (token string, perDe
 			return "", false, err
 		}
 		root, uid = c.session()
-		tok, err = c.mintDevice(ctx, d, root, uid)
+		tok, err = c.mintDevice(mctx, d, root, uid)
 	}
-	if errors.Is(err, errNoDeviceLogin) {
+	var credErr *CredentialError
+	switch {
+	case errors.Is(err, errNoDeviceLogin):
 		return root, false, nil
-	}
-	if err != nil {
+	case err != nil && ctx.Err() == nil && !errors.As(err, &credErr):
+		// The upstream is slow or failing: serve this request on our own
+		// session rather than fail it, and try again later.
+		ds.retryAt = time.Now().Add(mintRetry)
+		return root, false, nil
+	case err != nil:
 		return "", false, err
 	}
 	ds.token = tok

@@ -262,6 +262,21 @@ def main():
     else:
         check("speed: could tell the serving upstream", False, first)
 
+    # A hung upstream (accepts connections, never answers) only delays what
+    # it alone can serve: first within its device session bound (10 s) plus
+    # the request timeout (15 s), then within 5 s once it is known down.
+    drone = next(i for i in jb.call("GET", f"/Users/{jb.uid}/Items", Recursive="true", IncludeItemTypes="Audio",
+                                    SearchTerm="Drone")["Items"])["Id"]
+    faults("b", latency_ms=60000)
+    fast = [jb.get(p)[3] for p in (f"/UserViews?userId={jb.uid}", f"/Users/{jb.uid}/Items/{drone}", f"/Items/{bars}/Images/Primary")]
+    first = jb.get(f"/Items/{drone}/Similar?userId={jb.uid}")
+    second = jb.get(f"/Items/{drone}/Similar?userId={jb.uid}")
+    faults("b")
+    check("hung b: browsing and a's artwork stay fast", max(fast) < 1, [round(x, 2) for x in fast])
+    check("hung b: a request only b can answer gives up in time", first[0] == 502 and first[3] < 28, (first[0], round(first[3], 1)))
+    check("hung b: once b is known down, such requests fail fast", second[0] == 502 and second[3] < 7, (second[0], round(second[3], 1)))
+    check("b reachable again after hanging", wait_reachable(jb, "b"))
+
     # PlaybackInfo does not wait long for a slow upstream.
     faults("b", latency_ms=8000)
     info, secs = jb.playback_info(item)

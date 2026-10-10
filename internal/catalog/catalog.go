@@ -81,6 +81,12 @@ func (c *Catalog) Reload(ctx context.Context) error {
 	return nil
 }
 
+// Counts returns the number of visible items and libraries.
+func (c *Catalog) Counts() (items, libraries int) {
+	s := c.snap.Load()
+	return len(s.nodes), len(s.views)
+}
+
 // Hidden reports whether a unified ID names an item hidden by the set
 // operation. Unknown IDs are not hidden.
 func (c *Catalog) Hidden(id string) bool {
@@ -700,7 +706,7 @@ func (c *Catalog) rewriter(ctx context.Context, s *snapshot, up, userID string, 
 		}
 		memo[r] = u
 		return u, true
-	}}
+	}, Paths: true}
 }
 
 func decode(raw []byte) map[string]any {

@@ -40,11 +40,15 @@ Rules for implementation:
   function and keep only the digest.
 - **Caching is delegated to clients.** Upstream `Cache-Control`, `ETag`, and
   `Last-Modified` headers pass through, so clients and browsers cache artwork themselves.
-  `ImageTags` already change whenever an image changes.
-- **Enforcement:** a test runs the full integration suite with JellyBloom's data directory
-  inspected afterwards. It may contain only the SQLite database and no files larger than
-  the database's expected size. CI also fails on `os.Create`, `os.CreateTemp`, or
-  `os.WriteFile` outside the store package.
+  `ImageTags` already change whenever an image changes. (Relayed files drop `ETag` and
+  `Last-Modified`, which differ between upstreams for the same file; see Failover.)
+- **Enforcement:** `internal/storagecheck` parses every non-test Go file and fails on
+  file-writing calls (`os.Create`, `CreateTemp`, `WriteFile`, `OpenFile`, `MkdirTemp`,
+  `Rename`, …) and on multipart parsing (which spools to temp files) outside
+  `internal/secrets`, which stores upstream tokens. `TestNoLocalStorage` plays media through
+  JellyBloom (relays with failover, HLS, artwork, user data, a playlist) with `TMPDIR`
+  redirected, then checks that only the SQLite files exist and that they stayed far smaller
+  than the media relayed. CI runs both on every push.
 
 ## Core concepts
 
@@ -96,6 +100,8 @@ SQLite index of every upstream item. It stores the full DTO JSON per `(upstream,
 ### Views
 `/UserViews` is synthesized by grouping upstream libraries by `CollectionType`. A music-only
 upstream and a video-only upstream together produce Music, Movies, and Shows views.
+Libraries with no visible items (for example, one only a subtracted upstream has) are
+left out.
 
 ### Redundant sources
 A unified item usually has several copies across upstreams. JellyBloom keeps all of them
@@ -216,8 +222,16 @@ a request has none) has an **active upstream**, the one serving it:
 - **Responses, text bodies only (JSON, m3u8, HTML, JS):**
   - Every GUID that is a known real ID on that upstream → its unified ID.
   - An unknown GUID gets a lazy mapping, `UUIDv5(upstream:id)`, recorded in the mapping
-    table, so it can be routed later.
+    table, so it can be routed later. Such *minted* IDs (cache tags and the like) prefer
+    their upstream when routing but never keep a request from failing over; *aliases*
+    JellyBloom sets up (versions, play sessions, merged libraries) do constrain routing.
+    Play session aliases are pruned after 7 days.
   - The upstream base URL and token are stripped.
+  - File paths (`Path` in item, media source, and stream DTOs) become neutral:
+    `/media/` plus the last three parts for a file (library folder, item folder, file
+    name) or two for a folder, so no upstream's directory layout shows and copies of a file
+    look alike everywhere. URLs of remote streams are left alone. The admin report keeps
+    the real paths.
 - **Binary bodies** pass through untouched.
 
 ### Playback
@@ -243,6 +257,39 @@ a request has none) has an **active upstream**, the one serving it:
 - `/System/Info(/Public)`, branding, display preferences, a single stable `ServerId`.
 - Client WebSocket `/socket`: KeepAlive, plus `LibraryChanged` and `UserDataChanged`.
 - Case-insensitive routing.
+
+### Partial failure
+One upstream failing, hanging, or answering slowly must only cost what that upstream alone
+can serve:
+- **Timeouts per request type.** An upstream must start answering an API request within
+  `upstream_timeout` (15 s), media requests (streams, HLS, subtitles, PlaybackInfo) within
+  60 s (transcodes start slowly), and an upstream already known to be unreachable within
+  5 s. Bodies then stream untimed (relays have their own stall guard).
+- **Retry elsewhere.** A request that times out or fails to connect is retried on the next
+  upstream holding the items, and the upstream is marked unreachable, so later requests go
+  elsewhere first; a request or a ping (every 30 s) that succeeds marks it reachable again.
+- **Device sessions.** Giving a client device its own upstream session (Quick Connect) is
+  bounded to 10 s; if it fails, the request uses JellyBloom's own session and minting is
+  retried a minute later.
+- **Fan-out.** PlaybackInfo asks reachable upstreams only and waits at most 3 s for slower
+  ones after the first answers; upstream collections and other fan-outs are bounded by the
+  request timeouts.
+- Everything answered from the index (libraries, lists, search, details, user state) never
+  waits on an upstream.
+
+On the rig, with one server hanging, browsing stays instant; a request only that server can
+answer gives up within 25 s the first time and 5 s after.
+
+### Observability
+- **Logs:** `slog`, text or JSON, with every attribute passed through credential redaction.
+  Each request is logged at debug level (5xx at warn): method, path with IDs templated, the
+  matched route, status, bytes, time to first byte, total time. Query strings, which carry
+  tokens, are never logged.
+- **Metrics** (`metrics_listen`, Prometheus text format, a separate address so the client
+  port stays identical to Jellyfin's): client requests by route and status, time to first
+  byte, response bytes; upstream requests by outcome, retries, reachability, latency, and
+  throughput; relay bytes and failovers; quarantined and flagged copies; play sessions;
+  index items and sync state per upstream; visible items and libraries; socket clients.
 
 ## Minimal generic routing (plugins and unimplemented endpoints)
 
@@ -351,14 +398,20 @@ be reused elsewhere.
 | 9 | **Set operations and hardening** | Intersection and difference, cache-header pass-through, no-local-storage enforcement test, timeouts, partial-failure handling, metrics, Dockerfile | All set operations pass integration tests; upstream outages degrade gracefully |
 
 ### Testing
-- **Unit tests:** match keys, ID mapping, set operations, GUID and URL rewriter, HLS
-  playlist rewriter.
-- **Integration tests:** a docker-compose setup with a music-only Jellyfin, a video-only
-  Jellyfin, and an overlapping-video Jellyfin. Includes one upstream running a plugin with
-  an HTTP API, such as Intro Skipper, to exercise generic routing.
+- **Unit and server tests** (`go test ./...`): fakes of Jellyfin per package; the server
+  tests run the whole stack (index, identity, catalog, proxy, sources) against two fake
+  upstreams, including every set operation, failover, hung upstreams, and the
+  no-local-storage invariant.
+- **Rig** (`testrig/`, native, no containers): two real Jellyfin servers with synthetic
+  media, behind a fault-injecting proxy. `smoke.py` drives JellyBloom like a client;
+  `compare.py` diffs user-state behavior against real Jellyfin; `failover.py` injects
+  faults; `setops.py` runs intersection and both differences against the servers' contents.
+- **Container:** `Containerfile`, built and run with podman; CI builds it too.
 - **Manual:** jellyfin-web first, then one mobile or TV client and one music client.
 
 ## Config additions
+
+See `config.example.yaml` for the full file. Beyond upstreams and users:
 
 ```yaml
 merge: difference         # union | intersection | difference
@@ -366,9 +419,8 @@ base: home                # difference only: A in A \ B
 subtract: [friend]        # difference only: B (one or more upstreams)
 web_upstream: home        # upstream serving /web (default: first upstream)
 stall_timeout: 10s        # a relayed file this long without bytes fails over
-upstreams:
-  - name: friend
-    url: https://jellyfin.example.com
-    api_key: 0123456789abcdef
-    user: guest           # required when using api_key
+upstream_timeout: 15s     # an upstream this long without answering an API request is skipped
+metrics_listen: 127.0.0.1:9101   # Prometheus metrics (separate address; off by default)
+log_format: json          # text (default) | json
+log_level: info           # debug | info | warn | error
 ```

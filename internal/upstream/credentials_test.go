@@ -175,6 +175,42 @@ func TestDeviceTokensViaQuickConnect(t *testing.T) {
 	}
 }
 
+// A hung upstream must not hold a client's requests up while JellyBloom
+// tries to give the client its own session: after a bounded wait the
+// request uses JellyBloom's session, and minting is retried later.
+func TestDeviceTokenWhenUpstreamHangs(t *testing.T) {
+	defer func(t, r time.Duration) { mintTimeout, mintRetry = t, r }(mintTimeout, mintRetry)
+	mintTimeout, mintRetry = 200*time.Millisecond, time.Hour
+	ctx := testCtx(t)
+	f := newFake(t)
+	sec := Secret{Kind: KindToken, Value: f.issue("me", "jb")}
+	c := f.client(t, storeCreds(&sec))
+	d := Device{ID: DeviceID("fake", "user1", "phone")}
+
+	f.mu.Lock()
+	f.qcHang = true
+	f.mu.Unlock()
+	start := time.Now()
+	tok, per, err := c.DeviceToken(ctx, d)
+	if err != nil || per || tok != sec.Value || time.Since(start) > 2*time.Second {
+		t.Fatalf("hung upstream: %q per=%v err=%v after %s", tok, per, err, time.Since(start))
+	}
+	// Within the retry interval: no new attempt, no wait.
+	start = time.Now()
+	if tok, per, _ := c.DeviceToken(ctx, d); per || tok != sec.Value || time.Since(start) > 50*time.Millisecond {
+		t.Errorf("second call: per=%v after %s", per, time.Since(start))
+	}
+	// Once the interval passes and the upstream recovers, the device gets
+	// its own session.
+	f.mu.Lock()
+	f.qcHang = false
+	f.mu.Unlock()
+	c.deviceSession(d.ID).retryAt = time.Time{}
+	if tok, per, err := c.DeviceToken(ctx, d); err != nil || !per || tok == sec.Value {
+		t.Errorf("after recovery: per=%v err=%v", per, err)
+	}
+}
+
 func TestDeviceTokensFallbacks(t *testing.T) {
 	ctx := testCtx(t)
 	f := newFake(t)

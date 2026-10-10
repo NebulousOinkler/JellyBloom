@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,6 +27,7 @@ import (
 	"github.com/NebulousOinkler/JellyBloom/internal/config"
 	"github.com/NebulousOinkler/JellyBloom/internal/identity"
 	"github.com/NebulousOinkler/JellyBloom/internal/index"
+	"github.com/NebulousOinkler/JellyBloom/internal/metrics"
 	"github.com/NebulousOinkler/JellyBloom/internal/pairing"
 	"github.com/NebulousOinkler/JellyBloom/internal/playback"
 	"github.com/NebulousOinkler/JellyBloom/internal/proxy"
@@ -38,12 +40,7 @@ import (
 )
 
 func main() {
-	level := slog.LevelInfo
-	if strings.EqualFold(os.Getenv("JELLYBLOOM_LOG"), "debug") {
-		level = slog.LevelDebug
-	}
-	// Every log line passes through credential redaction.
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level, ReplaceAttr: redact.ReplaceAttr})))
+	setupLogging("", "")
 
 	subcommands := map[string]func([]string) error{
 		"hash-password": func([]string) error { return hashPassword() },
@@ -68,6 +65,80 @@ func main() {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
+}
+
+// registerGauges adds the metrics read at scrape time: upstream health and
+// speed, copy checks, sync state, and what clients see.
+func registerGauges(store *index.Store, names []string, reg *sources.Registry, cat *catalog.Catalog, srv *server.Server) {
+	m := metrics.Default
+	type emitFn = func(v float64, labels ...string)
+	one := func(b bool) float64 {
+		if b {
+			return 1
+		}
+		return 0
+	}
+	m.NewGaugeFunc("jellybloom_build_info", "JellyBloom's version and the Go version it was built with.", []string{"version", "go_version"},
+		func(emit emitFn) { emit(1, upstream.Version, runtime.Version()) })
+	m.NewGaugeFunc("jellybloom_upstream_up", "Whether the upstream is reachable.", []string{"upstream"}, func(emit emitFn) {
+		for _, u := range reg.UpstreamStates() {
+			emit(one(u.Reachable), u.Name)
+		}
+	})
+	m.NewGaugeFunc("jellybloom_upstream_latency_seconds", "Measured response latency to the upstream (moving average).", []string{"upstream"}, func(emit emitFn) {
+		for _, u := range reg.UpstreamStates() {
+			if u.LatencyMs > 0 {
+				emit(u.LatencyMs/1000, u.Name)
+			}
+		}
+	})
+	m.NewGaugeFunc("jellybloom_upstream_throughput_bytes_per_second", "Measured relay throughput from the upstream (moving average).", []string{"upstream"}, func(emit emitFn) {
+		for _, u := range reg.UpstreamStates() {
+			if u.ThroughputMBps > 0 {
+				emit(u.ThroughputMBps*1e6, u.Name)
+			}
+		}
+	})
+	m.NewGaugeFunc("jellybloom_sources_quarantined", "Copies quarantined after repeated failures.", nil,
+		func(emit emitFn) { emit(float64(reg.Counts().Quarantined)) })
+	m.NewGaugeFunc("jellybloom_copies_flagged", "Copies with a content verdict, by state (truncated, damaged, disputed).", []string{"state"}, func(emit emitFn) {
+		for state, n := range reg.Counts().Verdicts {
+			emit(float64(n), state)
+		}
+	})
+	m.NewGaugeFunc("jellybloom_play_sessions", "Play sessions being tracked.", nil,
+		func(emit emitFn) { emit(float64(reg.Counts().Sessions)) })
+	status := func(emit func(st index.Status)) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		for _, n := range names {
+			if st, err := store.Status(ctx, n); err == nil {
+				emit(st)
+			}
+		}
+	}
+	m.NewGaugeFunc("jellybloom_index_items", "Items indexed from the upstream.", []string{"upstream"},
+		func(emit emitFn) { status(func(st index.Status) { emit(float64(st.Items), st.Upstream) }) })
+	m.NewGaugeFunc("jellybloom_index_last_full_sync_timestamp_seconds", "When the upstream was last fully synced.", []string{"upstream"},
+		func(emit emitFn) {
+			status(func(st index.Status) {
+				if !st.LastFullSync.IsZero() {
+					emit(float64(st.LastFullSync.Unix()), st.Upstream)
+				}
+			})
+		})
+	m.NewGaugeFunc("jellybloom_index_sync_failing", "Whether the upstream's last sync failed.", []string{"upstream"},
+		func(emit emitFn) { status(func(st index.Status) { emit(one(st.LastError != ""), st.Upstream) }) })
+	m.NewGaugeFunc("jellybloom_catalog_items", "Items visible to clients.", nil, func(emit emitFn) {
+		items, _ := cat.Counts()
+		emit(float64(items))
+	})
+	m.NewGaugeFunc("jellybloom_catalog_libraries", "Libraries visible to clients.", nil, func(emit emitFn) {
+		_, libs := cat.Counts()
+		emit(float64(libs))
+	})
+	m.NewGaugeFunc("jellybloom_socket_clients", "Connected client sockets.", nil,
+		func(emit emitFn) { emit(float64(srv.SocketClients())) })
 }
 
 // library lists items with media files and their copies for the source
@@ -281,11 +352,36 @@ func hashPassword() error {
 	return nil
 }
 
+// setupLogging sets the default logger: text or JSON, at the given level
+// (JELLYBLOOM_LOG=debug overrides it). Every line passes through credential
+// redaction.
+func setupLogging(format, level string) {
+	lv := slog.LevelInfo
+	switch level {
+	case "debug":
+		lv = slog.LevelDebug
+	case "warn":
+		lv = slog.LevelWarn
+	case "error":
+		lv = slog.LevelError
+	}
+	if strings.EqualFold(os.Getenv("JELLYBLOOM_LOG"), "debug") {
+		lv = slog.LevelDebug
+	}
+	opts := &slog.HandlerOptions{Level: lv, ReplaceAttr: redact.ReplaceAttr}
+	var h slog.Handler = slog.NewTextHandler(os.Stderr, opts)
+	if format == "json" {
+		h = slog.NewJSONHandler(os.Stderr, opts)
+	}
+	slog.SetDefault(slog.New(h))
+}
+
 func run(configPath string) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
 	}
+	setupLogging(cfg.LogFormat, cfg.LogLevel)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -380,6 +476,7 @@ func run(configPath string) error {
 		Policy:      policy,
 		Hidden:      func(id string) bool { return cat.Hidden(id) },
 		Sources:     reg,
+		Timeout:     cfg.UpstreamTimeout,
 	})
 	if err != nil {
 		return err
@@ -437,6 +534,23 @@ func run(configPath string) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	registerGauges(store, names, reg, cat, srv)
+	if cfg.MetricsListen != "" {
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", metrics.Default)
+		ms := &http.Server{Addr: cfg.MetricsListen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			if err := ms.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("metrics server failed", "addr", cfg.MetricsListen, "err", err)
+			}
+		}()
+		go func() {
+			<-ctx.Done()
+			ms.Close()
+		}()
+		slog.Info("metrics listening", "addr", cfg.MetricsListen)
 	}
 
 	httpSrv := &http.Server{Addr: cfg.Listen, Handler: srv, ReadHeaderTimeout: 30 * time.Second}

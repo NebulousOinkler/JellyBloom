@@ -99,7 +99,7 @@ func New(o Options) (*Server, error) {
 	return s, nil
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.router.ServeHTTP(w, r) }
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.observe(w, r) }
 
 // Broadcast sends a message to every connected client socket.
 func (s *Server) Broadcast(messageType string, data any) { s.hub.broadcast(messageType, data) }

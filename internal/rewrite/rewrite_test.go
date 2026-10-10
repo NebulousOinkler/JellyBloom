@@ -99,3 +99,38 @@ func TestTemplate(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+func TestNeutralPath(t *testing.T) {
+	for _, tc := range []struct {
+		in     string
+		folder bool
+		want   string
+	}{
+		{"/mnt/nas1/Movies/Film (2001)/Film (2001).mkv", false, "/media/Movies/Film (2001)/Film (2001).mkv"},
+		{"/srv/media/b/Movies/Film (2001)/Film (2001).mkv", false, "/media/Movies/Film (2001)/Film (2001).mkv"},
+		{`D:\Media\Shows\Show\Season 01\Show S01E01.mkv`, false, "/media/Show/Season 01/Show S01E01.mkv"},
+		{"/data/shows/Show", true, "/media/shows/Show"},
+		{"smb://nas/share/Music/Artist/Album/01.flac", false, "/media/Artist/Album/01.flac"},
+		{"/x.mkv", false, "/media/x.mkv"},
+		{"https://cdn.example.com/live/stream.m3u8", false, "https://cdn.example.com/live/stream.m3u8"},
+		{"", false, ""},
+	} {
+		if got := NeutralPath(tc.in, tc.folder); got != tc.want {
+			t.Errorf("NeutralPath(%q, %v) = %q, want %q", tc.in, tc.folder, got, tc.want)
+		}
+	}
+	r := &Replacer{Paths: true}
+	got := string(r.JSON([]byte(`{"Path":"/mnt/a/Movies/F/F.mkv","IsFolder":false,"MediaSources":[{"Path":"/mnt/a/Movies/F/F.mkv","Name":"F"}],` +
+		`"Series":{"Path":"/mnt/a/Shows/S","IsFolder":true},"Name":"/not/a/path"}`)))
+	for _, want := range []string{`"Path":"/media/Movies/F/F.mkv"`, `"Path":"/media/Shows/S"`, `"Name":"/not/a/path"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("JSON = %s, missing %s", got, want)
+		}
+	}
+	if strings.Contains(got, "/mnt/") {
+		t.Errorf("real path left: %s", got)
+	}
+	if out := string((&Replacer{}).JSON([]byte(`{"Path":"/mnt/a/F.mkv"}`))); !strings.Contains(out, "/mnt/a/F.mkv") {
+		t.Errorf("paths changed without Paths set: %s", out)
+	}
+}

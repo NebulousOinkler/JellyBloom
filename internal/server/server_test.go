@@ -62,6 +62,7 @@ type fakeUpstream struct {
 	files   map[string][]byte           // media source ID -> file served by static streams
 	cut     int64                       // > 0: file bodies end after this many bytes
 	failHLS int                         // != 0: HLS requests get this status
+	hang    bool                        // API and media requests never answer
 }
 
 type recorded struct {
@@ -122,6 +123,13 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	f.mu.Lock()
+	hang := f.hang
+	f.mu.Unlock()
+	if hang && !strings.HasPrefix(r.URL.Path, "/QuickConnect") {
+		<-r.Context().Done()
+		return
+	}
 	m := tokenRe.FindStringSubmatch(r.Header.Get("Authorization"))
 	f.mu.Lock()
 	ok := m != nil && f.valid[m[1]]
@@ -378,7 +386,8 @@ func newEnvWith(t *testing.T, mode identity.Mode, data map[string]library) *env 
 	}
 	policy, _ := proxy.NewPolicy(nil)
 	px, err = proxy.New(proxy.Options{Upstreams: clients, WebUpstream: "b", Resolver: e.res, ServerID: e.auth.ServerID(),
-		Policy: policy, Hidden: func(id string) bool { return cat.Hidden(id) }, Sources: e.reg})
+		Policy: policy, Hidden: func(id string) bool { return cat.Hidden(id) }, Sources: e.reg,
+		Timeout: 2 * time.Second, MediaTimeout: 2 * time.Second, DownTimeout: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1310,7 +1319,9 @@ func TestUpstreamCollections(t *testing.T) {
 // upstreams, as indexed with Fields=MediaSources.
 func fileData(sizeA, sizeB int) map[string]library {
 	ms := func(id string, size int) []map[string]any {
-		return []map[string]any{mediaSource(id, "h264", 1920, 1080, size)}
+		m := mediaSource(id, "h264", 1920, 1080, size)
+		m["Path"] = "/mnt/" + id + "/Movies/Shared (2001)/Shared (2001).mkv"
+		return []map[string]any{m}
 	}
 	data := map[string]library{}
 	for up, lib := range defaultData {
@@ -1323,6 +1334,7 @@ func fileData(sizeA, sizeB int) map[string]library {
 				}
 				if c["Id"] == shared[up] {
 					c["MediaSources"] = ms(shared[up], map[string]int{"a": sizeA, "b": sizeB}[up])
+					c["Path"] = "/mnt/" + up + "/Movies/Shared (2001)/Shared (2001).mkv"
 				}
 				items[v] = append(items[v], c)
 			}
@@ -1334,8 +1346,13 @@ func fileData(sizeA, sizeB int) map[string]library {
 
 // withFiles stores file contents on the fakes and their PlaybackInfo.
 func (e *env) withFiles(a, b []byte) {
-	e.a.media = map[string][]map[string]any{shared["a"]: {mediaSource(shared["a"], "h264", 1920, 1080, len(a))}}
-	e.b.media = map[string][]map[string]any{shared["b"]: {mediaSource(shared["b"], "h264", 1920, 1080, len(b))}}
+	ms := func(up string, n int) map[string]any {
+		m := mediaSource(shared[up], "h264", 1920, 1080, n)
+		m["Path"] = "/srv/" + up + "-media/Movies/Shared (2001)/Shared (2001).mkv"
+		return m
+	}
+	e.a.media = map[string][]map[string]any{shared["a"]: {ms("a", len(a))}}
+	e.b.media = map[string][]map[string]any{shared["b"]: {ms("b", len(b))}}
 	e.a.files = map[string][]byte{shared["a"]: a}
 	e.b.files = map[string][]byte{shared["b"]: b}
 }
@@ -1361,6 +1378,18 @@ func TestDirectPlayFailsOverMidStream(t *testing.T) {
 	}
 	psid := info["PlaySessionId"].(string)
 	msID := srcs[0].(map[string]any)["Id"].(string)
+	// Clients see neutral file paths, the same for every copy.
+	const neutral = "/media/Movies/Shared (2001)/Shared (2001).mkv"
+	if p := srcs[0].(map[string]any)["Path"]; p != neutral {
+		t.Errorf("PlaybackInfo path = %v", p)
+	}
+	d := e.do("GET", "/Users/"+e.userID+"/Items/"+item, e.token, nil)
+	if m := d.json(t); m["Path"] != neutral || m["MediaSources"].([]any)[0].(map[string]any)["Path"] != neutral {
+		t.Errorf("item paths = %v, %v", m["Path"], m["MediaSources"])
+	}
+	if bytes.Contains(d.body, []byte("/mnt/")) || bytes.Contains(d.body, []byte("/srv/")) {
+		t.Errorf("an upstream path leaked: %s", d.body)
+	}
 
 	// a breaks off after 1 MiB; the client still gets the whole file.
 	e.a.mu.Lock()
@@ -1453,5 +1482,45 @@ func TestHLSFailsOverToAnotherUpstream(t *testing.T) {
 	seg(2)
 	if len(e.a.find(".ts")) != before {
 		t.Error("segment 2 tried a again")
+	}
+}
+
+// A hung upstream (accepting connections, never answering) costs a request
+// at most the timeout, after which it is retried elsewhere; once the
+// upstream is known to be down, requests only it can answer fail fast.
+func TestHungUpstream(t *testing.T) {
+	e := newEnv(t, identity.Mode{})
+	e.login()
+	e.do("GET", "/Items/"+e.uid("a", aOnly)+"/Similar", e.token, nil) // a has a session for the device
+	e.a.mu.Lock()
+	e.a.hang = true
+	e.a.mu.Unlock()
+
+	timed := func(path string) (resp, time.Duration) {
+		start := time.Now()
+		r := e.do("GET", path, e.token, nil)
+		return r, time.Since(start)
+	}
+	// The shared item goes to a first, times out, and is served by b.
+	r, d := timed("/Items/" + e.uid("a", shared["a"]) + "/Similar")
+	if r.code != 200 || r.json(t)["Upstream"] != "b" || d > 10*time.Second {
+		t.Fatalf("shared item while a hangs: %d %s after %s", r.code, r.body, d)
+	}
+	if !e.reg.Down("a") {
+		t.Fatal("a timed out but is not marked down")
+	}
+	// Now b is asked first: a is not asked at all.
+	before := len(e.a.find("/Similar"))
+	if r, _ := timed("/Items/" + e.uid("a", shared["a"]) + "/Similar"); r.code != 200 || len(e.a.find("/Similar")) != before {
+		t.Errorf("shared item once a is down: %d, a asked %d more times", r.code, len(e.a.find("/Similar"))-before)
+	}
+	// An item only a has fails within the short timeout for a down upstream,
+	// well before the normal 2 s.
+	if r, d := timed("/Items/" + e.uid("a", aOnly) + "/Similar"); r.code != http.StatusBadGateway || d > time.Second {
+		t.Errorf("a-only item: %d after %s", r.code, d)
+	}
+	// Local answers are unaffected.
+	if r, d := timed("/Users/" + e.userID + "/Items/" + e.uid("a", aOnly)); r.code != 200 || d > time.Second {
+		t.Errorf("item details: %d after %s", r.code, d)
 	}
 }

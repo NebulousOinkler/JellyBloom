@@ -103,8 +103,8 @@ with the "done when" check from that table. Target upstream version: Jellyfin 10
   its encode ("4K HEVC HDR"), never by upstream. A single version keeps the item ID.
 - Source order within a version is config order for now; phase 8 ranks by health and
   throughput and adds failover.
-- Follow-ups for phase 9: prune old play-session aliases; consider hiding upstream file
-  `Path` in media sources.
+- Follow-ups (done in phase 9): prune old play-session aliases; hide upstream file `Path`
+  in media sources.
 
 ## Findings from the real rig (Jellyfin 12.2)
 - Library contents sit under a physical root `Folder`; it is now transparent, as in Jellyfin.
@@ -232,7 +232,39 @@ broken copy that is the only one available is still served, and reported.
   measured to JellyBloom, not to the client
 
 ## Phase 9: Set operations and hardening
-- [ ] Integration tests for intersection and difference
-- [ ] Partial-failure handling and per-upstream timeouts in fan-out
-- [ ] No-local-storage enforcement test and CI check for file-writing calls
-- [ ] Metrics, structured logging, Dockerfile, docker-compose test rig
+Decisions (2026-10-10): install podman on the dev machine to build and run the image;
+metrics on a separate address, off by default; a GitHub Actions workflow; neutral file
+paths for clients.
+
+- [x] Intersection and difference end to end: `TestSetOperations` drives union,
+  intersection, a \ b, and b \ a through the client API (libraries, movies, Latest,
+  episodes, genres, music, series counts, artwork routing, lookups, PlaybackInfo sources,
+  favorites, search); mutation-checked against the set-operation engine. On the rig,
+  `testrig/setops.py` runs three extra instances and checks each against the servers' own
+  contents (14 checks)
+- [x] Partial failure: per-request upstream timeouts (API `upstream_timeout` 15 s, media
+  60 s, known-down upstream 5 s), retry on the next upstream after a timeout, device
+  session minting bounded to 10 s with a fallback to JellyBloom's session. With a hung
+  server on the rig, requests only it could answer took 80–90 s before and now take 25 s
+  the first time and 5 s after; browsing stays instant (`TestHungUpstream`, `failover.py`)
+- [x] No-local-storage enforcement: `internal/storagecheck` (source scan: no file writes or
+  multipart spooling outside the secret store) and `TestNoLocalStorage` (plays media with
+  `TMPDIR` redirected; only the SQLite files may exist, far smaller than the media);
+  both mutation-checked
+- [x] Metrics (`metrics_listen`, Prometheus text format, dependency-free
+  `internal/metrics`), per-request debug logging with templated paths and no query
+  strings, `log_format: json`, `log_level`
+- [x] `Containerfile` (static binary, distroless, non-root, 16 MB) built and run with
+  podman against the rig: browsing, PlaybackInfo, and byte-exact direct play from the
+  container; `/data` held only the database and the paired tokens
+- [x] CI (`.github/workflows/ci.yml`): gofmt, vet, race tests (including the storage
+  checks), static Linux binaries for amd64 and arm64, and the container image
+- [x] Neutral file paths for clients (`/media/` plus the last parts); the admin report
+  keeps the real ones
+- [x] Play session aliases are marked and pruned after 7 days; minted IDs (opaque upstream
+  GUIDs) only prefer their upstream when routing
+- [x] Cache headers pass through for artwork and other forwarded bodies (since phase 4);
+  relayed files drop per-upstream validators (phase 8)
+- Superseded: the docker-compose test rig (the native rig plus podman covers it)
+- Later: hot reload or an admin API for upstreams; per-person pairing; importing upstream
+  watch history; playlist sharing

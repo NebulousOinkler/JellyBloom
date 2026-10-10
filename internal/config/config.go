@@ -61,6 +61,18 @@ type Config struct {
 	// StallTimeout is how long a relayed file may stop sending before
 	// JellyBloom fails over to another copy (default 10s).
 	StallTimeout time.Duration `yaml:"stall_timeout"`
+	// UpstreamTimeout is how long an upstream may take to start answering an
+	// API request before JellyBloom gives up or tries another upstream
+	// (default 15s; media requests get 60s).
+	UpstreamTimeout time.Duration `yaml:"upstream_timeout"`
+	// MetricsListen serves Prometheus metrics on this address (e.g.
+	// 127.0.0.1:9101); empty, the default, serves none. Never the client
+	// port, which must look like Jellyfin's.
+	MetricsListen string `yaml:"metrics_listen"`
+	// LogFormat is text (default) or json; LogLevel is debug, info
+	// (default), warn, or error. JELLYBLOOM_LOG=debug overrides the level.
+	LogFormat string `yaml:"log_format"`
+	LogLevel  string `yaml:"log_level"`
 }
 
 var upstreamName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
@@ -95,8 +107,21 @@ func Load(path string) (*Config, error) {
 	if len(c.Upstreams) == 0 {
 		return nil, fmt.Errorf("no upstreams configured")
 	}
-	if c.StallTimeout < 0 {
-		return nil, fmt.Errorf("stall_timeout must not be negative")
+	if c.StallTimeout < 0 || c.UpstreamTimeout < 0 {
+		return nil, fmt.Errorf("stall_timeout and upstream_timeout must not be negative")
+	}
+	switch c.LogFormat {
+	case "", "text", "json":
+	default:
+		return nil, fmt.Errorf("unknown log_format %q (want text or json)", c.LogFormat)
+	}
+	switch c.LogLevel {
+	case "", "debug", "info", "warn", "error":
+	default:
+		return nil, fmt.Errorf("unknown log_level %q (want debug, info, warn, or error)", c.LogLevel)
+	}
+	if c.MetricsListen != "" && c.MetricsListen == c.Listen {
+		return nil, fmt.Errorf("metrics_listen must differ from listen: the client port must look like Jellyfin's")
 	}
 	names := map[string]bool{}
 	for i, u := range c.Upstreams {

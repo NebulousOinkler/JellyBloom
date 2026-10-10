@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "$unformatted"; exit 1; fi
+      - name: Vet
+        run: go vet ./...
+      # Includes internal/storagecheck (no file writes outside the secret
+      # store) and the server's no-local-storage test.
+      - name: Test
+        run: go test -race -count=1 ./...
+      - name: Static Linux binaries
+        run: |
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -o /tmp/jellybloom-linux-$arch ./cmd/jellybloom
+          done
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the container image
+        run: podman build -t jellybloom:ci -f Containerfile .
+      - name: Run the image
+        run: |
+          hash=$(echo "ci-password" | podman run --rm -i jellybloom:ci hash-password)
+          case "$hash" in '$2a$'*) echo "ok: the binary runs in the image" ;; *) echo "unexpected output: $hash"; exit 1 ;; esac

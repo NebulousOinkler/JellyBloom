@@ -14,9 +14,10 @@ type router struct {
 }
 
 type route struct {
-	method string
-	segs   []string // lowercased literals, or "{name}" / "{name...}"
-	h      http.Handler
+	method  string
+	pattern string
+	segs    []string // lowercased literals, or "{name}" / "{name...}"
+	h       http.Handler
 }
 
 func split(p string) []string {
@@ -35,7 +36,7 @@ func (rt *router) handle(method, pattern string, h http.HandlerFunc) {
 			segs[i] = strings.ToLower(s)
 		}
 	}
-	rt.routes = append(rt.routes, route{method: method, segs: segs, h: h})
+	rt.routes = append(rt.routes, route{method: method, pattern: pattern, segs: segs, h: h})
 }
 
 func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -50,6 +51,9 @@ func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		for k, v := range params {
 			r.SetPathValue(k, v)
+		}
+		if o, ok := w.(interface{ setRoute(string) }); ok {
+			o.setRoute(ro.pattern)
 		}
 		ro.h.ServeHTTP(w, r)
 		return

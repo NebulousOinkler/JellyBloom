@@ -3,6 +3,7 @@ server_name: "JellyBloom"
 
 # Holds the metadata index (jellybloom.db) and, with the file secret store, upstream
 # tokens under data_dir/secrets (owner-only). Never contains media or other upstream files.
+# In the container image, use /data.
 data_dir: data
 
 # Where paired upstream tokens are kept: file (default) or keychain (OS keychain).
@@ -56,6 +57,20 @@ users:
   - name: me
     password_hash: "$2a$10$replace.with.output.of.hash-password"
     admin: true
+
+# Timeouts: how long an upstream may take to start answering an API request before
+# JellyBloom tries another copy or gives up (media requests get 60s), and how long a
+# relayed file may stop sending before playback moves to another copy.
+# upstream_timeout: 15s
+# stall_timeout: 10s
+
+# Prometheus metrics on a separate address (off by default). Keep it private: it names
+# your upstreams and their health.
+# metrics_listen: 127.0.0.1:9101
+
+# Logs: text (default) or json; debug, info (default), warn, or error.
+# log_format: json
+# log_level: info
 
 # Extra non-GET routes (regex on the lowercased path) the generic fallback may forward,
 # e.g. for plugin endpoints. Admin/system routes are always blocked.

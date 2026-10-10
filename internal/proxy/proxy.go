@@ -5,6 +5,7 @@ package proxy
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,11 +16,13 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/NebulousOinkler/JellyBloom/internal/identity"
+	"github.com/NebulousOinkler/JellyBloom/internal/metrics"
 	"github.com/NebulousOinkler/JellyBloom/internal/rewrite"
 	"github.com/NebulousOinkler/JellyBloom/internal/upstream"
 )
@@ -78,7 +81,7 @@ func (p *Proxy) authFor(ctx context.Context, up *upstream.Client, c Caller) (*au
 			}, nil
 		}
 		// No way to give this client its own upstream session: share ours.
-		if _, warned := p.sharedWarned.LoadOrStore(up.Name(), true); !warned {
+		if _, warned := p.sharedWarned.LoadOrStore(up.Name(), true); !warned && up.SharedDevices() {
 			p.log.Warn("clients share one upstream session (Quick Connect is off and there is no password_file); "+
 				"their sessions and transcodes may interfere", "upstream", up.Name())
 		}
@@ -94,6 +97,13 @@ func (p *Proxy) authFor(ctx context.Context, up *upstream.Client, c Caller) (*au
 		token2: func(ctx context.Context) (string, error) { t, _, err := up.Session(ctx); return t, err },
 	}, nil
 }
+
+var (
+	upstreamRequests = metrics.Default.NewCounter("jellybloom_upstream_requests_total",
+		"Requests to upstreams, by outcome: the status class, error, or timeout.", "upstream", "outcome")
+	upstreamRetries = metrics.Default.NewCounter("jellybloom_upstream_retries_total",
+		"Client requests retried on another upstream after this one failed them.", "upstream")
+)
 
 const (
 	maxRewriteBody = 64 << 20 // text responses larger than this are refused
@@ -115,7 +125,12 @@ type Options struct {
 	// Sources, if set, steers requests to the upstream serving their play
 	// session and away from unreachable upstreams.
 	Sources Sources
-	Logger  *slog.Logger
+	// Timeout bounds how long an upstream may take to answer an API request
+	// (default 15s). Media requests get MediaTimeout (default 60s: starting
+	// a transcode can be slow). An upstream known to be unreachable gets
+	// DownTimeout (default 5s), so it is retried without holding clients up.
+	Timeout, MediaTimeout, DownTimeout time.Duration
+	Logger                             *slog.Logger
 }
 
 // Sources is the source registry the proxy consults; *sources.Registry
@@ -144,6 +159,7 @@ type Proxy struct {
 	policy   *Policy
 	hidden   func(string) bool
 	sources  Sources
+	timeouts [3]time.Duration // API, media, down
 	hc       *http.Client
 	log      *slog.Logger
 
@@ -176,6 +192,7 @@ func New(o Options) (*Proxy, error) {
 	p := &Proxy{
 		ups: o.Upstreams, byName: map[string]*upstream.Client{}, res: o.Resolver, serverID: o.ServerID,
 		policy: o.Policy, hidden: o.Hidden, sources: o.Sources, log: o.Logger, serverIDs: map[string]string{}, seen: map[string]bool{},
+		timeouts: [3]time.Duration{cmp.Or(o.Timeout, 15*time.Second), cmp.Or(o.MediaTimeout, 60*time.Second), cmp.Or(o.DownTimeout, 5*time.Second)},
 		// No overall timeout: media streams last as long as playback.
 		hc: &http.Client{Transport: o.Transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 	}
@@ -327,6 +344,7 @@ func (p *Proxy) Fallback(w http.ResponseWriter, r *http.Request, c Caller) {
 		if first == "" {
 			first = up.Name()
 		}
+		upstreamRetries.Inc(up.Name())
 		p.log.Warn("upstream failed a request; trying another", "upstream", up.Name(), "path", rewrite.Template(r.URL.Path))
 	}
 }
@@ -653,6 +671,19 @@ func (p *Proxy) send(ctx context.Context, up *upstream.Client, c Caller, method,
 	target.RawPath = ""
 	target.RawQuery = query
 
+	// The upstream must start answering within the timeout for this kind of
+	// request; the body then streams for as long as it takes.
+	timeout := p.timeouts[0]
+	if isMedia(path) {
+		timeout = p.timeouts[1]
+	}
+	if p.sources != nil && p.sources.Down(up.Name()) {
+		timeout = min(timeout, p.timeouts[2])
+	}
+	parent := ctx
+	ctx, cancel := context.WithCancel(ctx)
+	timer := time.AfterFunc(timeout, cancel)
+
 	do := func(token string) (*http.Response, error) {
 		var rb io.Reader = stream
 		if body != nil {
@@ -685,17 +716,58 @@ func (p *Proxy) send(ctx context.Context, up *upstream.Client, c Caller, method,
 			}
 		}
 	}
+	timedOut := !timer.Stop()
+	switch {
+	case err == nil:
+		resp.Body = &cancelOnClose{resp.Body, cancel}
+		upstreamRequests.Inc(up.Name(), strconv.Itoa(resp.StatusCode/100)+"xx")
+	case timedOut && parent.Err() == nil:
+		cancel()
+		// Not wrapped: the cancellation is ours, not the client leaving.
+		err = fmt.Errorf("no answer within %s", timeout)
+		upstreamRequests.Inc(up.Name(), "timeout")
+	default:
+		cancel()
+		if parent.Err() == nil {
+			upstreamRequests.Inc(up.Name(), "error")
+		}
+	}
 	// Every upstream request tells the source registry whether the upstream
 	// is reachable.
 	if p.sources != nil {
 		switch {
 		case err == nil:
 			p.sources.UpstreamOK(up.Name())
-		case ctx.Err() == nil:
+		case parent.Err() == nil:
 			p.sources.UpstreamFailed(up.Name(), err)
 		}
 	}
 	return resp, a, err
+}
+
+// cancelOnClose releases a request's context when its body is closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnClose) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
+}
+
+// isMedia reports whether an upstream path serves media: streams, HLS,
+// downloads, subtitles (extracted on demand), and PlaybackInfo (which may
+// probe the file).
+func isMedia(path string) bool {
+	p := strings.ToLower(path)
+	for _, s := range []string{"/stream", "/universal", ".m3u8", "/hls", "/download", "/subtitles/", "/attachments/", "/trickplay/", "/playbackinfo"} {
+		if strings.Contains(p, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // Call sends one request to the named upstream on behalf of c (as c's
@@ -785,6 +857,7 @@ func (p *Proxy) responseReplacer(ctx context.Context, r *http.Request, up *upstr
 			return id, true
 		},
 		Literals: []string{base, externalBase(r), token, c.Token, upDevice, c.DeviceID},
+		Paths:    true,
 	}
 }
 

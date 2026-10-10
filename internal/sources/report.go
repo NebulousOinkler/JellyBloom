@@ -74,26 +74,7 @@ type ReportCopy struct {
 func (r *Registry) Report(ctx context.Context) (*Report, error) {
 	rep := &Report{Generated: r.now().UTC()}
 	if r.opts.Open != nil {
-		r.mu.Lock()
-		for _, name := range r.opts.Upstreams {
-			s := r.statsOf(name)
-			u := UpstreamReport{Name: name, Reachable: !s.down}
-			if !s.since.IsZero() {
-				t := s.since.UTC()
-				u.Since = &t
-			}
-			if s.down {
-				u.Error = s.downErr
-			}
-			if s.latency.n > 0 {
-				u.LatencyMs = round(s.latency.v * 1000)
-			}
-			if s.throughput.n > 0 {
-				u.ThroughputMBps = round(s.throughput.v / 1e6)
-			}
-			rep.Upstreams = append(rep.Upstreams, u)
-		}
-		r.mu.Unlock()
+		rep.Upstreams = r.UpstreamStates()
 	}
 	if r.opts.Library == nil {
 		return rep, nil
@@ -168,6 +149,55 @@ func (r *Registry) Report(ctx context.Context) (*Report, error) {
 }
 
 func round(f float64) float64 { return float64(int64(f*10+0.5)) / 10 }
+
+// UpstreamStates returns each upstream's measured state.
+func (r *Registry) UpstreamStates() []UpstreamReport {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []UpstreamReport
+	for _, name := range r.opts.Upstreams {
+		s := r.statsOf(name)
+		u := UpstreamReport{Name: name, Reachable: !s.down}
+		if !s.since.IsZero() {
+			t := s.since.UTC()
+			u.Since = &t
+		}
+		if s.down {
+			u.Error = s.downErr
+		}
+		if s.latency.n > 0 {
+			u.LatencyMs = round(s.latency.v * 1000)
+		}
+		if s.throughput.n > 0 {
+			u.ThroughputMBps = round(s.throughput.v / 1e6)
+		}
+		out = append(out, u)
+	}
+	return out
+}
+
+// Counts are the registry's current totals, for metrics.
+type Counts struct {
+	Quarantined int
+	Verdicts    map[string]int // by state
+	Sessions    int
+}
+
+// Counts returns the registry's current totals.
+func (r *Registry) Counts() Counts {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c := Counts{Verdicts: map[string]int{Truncated: 0, Damaged: 0, Disputed: 0}, Sessions: len(r.sessions)}
+	for _, h := range r.health {
+		if h.until.After(r.now()) {
+			c.Quarantined++
+		}
+	}
+	for _, v := range r.verdicts {
+		c.Verdicts[v.State]++
+	}
+	return c
+}
 
 // unchecked reports whether copies that grouping compares lack fingerprints.
 func (r *Registry) unchecked(ctx context.Context, copies []Copy) bool {

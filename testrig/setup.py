@@ -152,6 +152,7 @@ data_dir: "{os.path.join(DATA, 'jb', 'state')}"
 merge: union
 web_upstream: a
 stall_timeout: 3s
+metrics_listen: "127.0.0.1:8209"
 upstreams:
 {ups}
 users:

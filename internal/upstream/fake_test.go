@@ -35,7 +35,8 @@ type fakeJellyfin struct {
 	tokens     map[string]string // token -> user id
 	logins     int
 	items      []map[string]any
-	failNext   int // respond 503 to this many authenticated requests
+	failNext   int  // respond 503 to this many authenticated requests
+	qcHang     bool // Quick Connect requests hang until the client gives up
 	lastQuery  map[string]string
 	lastAuth   string
 	keepAlives int
@@ -362,6 +363,15 @@ func (f *fakeJellyfin) qcEnabledHandler(w http.ResponseWriter, r *http.Request) 
 }
 
 func (f *fakeJellyfin) qcInitiate(w http.ResponseWriter, r *http.Request) {
+	if f.get(func() int {
+		if f.qcHang {
+			return 1
+		}
+		return 0
+	}) == 1 {
+		<-r.Context().Done()
+		return
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.qcEnabled {

@@ -75,6 +75,41 @@ type Replacer struct {
 	// upstream base URL and token. Tokens look like GUIDs, so GUID must
 	// leave the old token alone; the new token is never seen by GUID.
 	Literals []string
+	// Paths replaces file paths ("Path" values in JSON) with neutral ones
+	// (see NeutralPath), so no upstream's directory layout shows and copies
+	// of a file look alike on every upstream.
+	Paths bool
+}
+
+// NeutralPath reduces a file path to its last parts under /media: three for
+// a file (library folder, item folder, file name), two for a folder. URLs
+// of remote streams are left alone: clients may play them directly.
+func NeutralPath(p string, folder bool) string {
+	if i := strings.Index(p, "://"); i > 0 {
+		switch strings.ToLower(p[:i]) {
+		case "file", "smb", "nfs":
+			p = p[i+3:]
+		default:
+			return p
+		}
+	}
+	var parts []string
+	for _, s := range strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if !strings.HasSuffix(s, ":") { // Windows drive letters
+			parts = append(parts, s)
+		}
+	}
+	if len(parts) == 0 {
+		return p
+	}
+	keep := 3
+	if folder {
+		keep = 2
+	}
+	if len(parts) > keep {
+		parts = parts[len(parts)-keep:]
+	}
+	return "/media/" + strings.Join(parts, "/")
 }
 
 // String rewrites s.
@@ -137,6 +172,11 @@ func (r *Replacer) walk(v any) any {
 		for k, val := range t {
 			if skipKey(k) {
 				out[k] = val
+				continue
+			}
+			if p, ok := val.(string); ok && r.Paths && k == "Path" {
+				folder, _ := t["IsFolder"].(bool)
+				out[k] = r.String(NeutralPath(p, folder))
 				continue
 			}
 			out[r.String(k)] = r.walk(val)

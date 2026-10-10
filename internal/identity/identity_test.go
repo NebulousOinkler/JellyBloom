@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"testing"
+	"time"
 
 	"github.com/NebulousOinkler/JellyBloom/internal/index"
 )
@@ -402,6 +403,50 @@ func TestNormalizeID(t *testing.T) {
 	} {
 		if got := NormalizeID(in); got != want {
 			t.Errorf("NormalizeID(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestPruneSessionAliases(t *testing.T) {
+	ctx := context.Background()
+	idx, err := index.Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	r, err := New(idx, Mode{Op: Union, Upstreams: []string{"a"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, version := DeriveID("session"), DeriveID("version")
+	if err := r.SetAliases(ctx, []Alias{
+		{ID: session, Refs: []Ref{{Upstream: "a", ID: "00000000000000000000000000000001"}}, Session: true},
+		{ID: version, Refs: []Ref{{Upstream: "a", ID: "00000000000000000000000000000002"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	minted, err := r.UnifiedID(ctx, "a", "00000000000000000000000000000003")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u, err := r.Lookup(ctx, session); err != nil || u.Minted {
+		t.Fatalf("session alias: %+v %v", u, err)
+	}
+	if u, _ := r.Lookup(ctx, minted); !u.Minted {
+		t.Error("minted ID not marked")
+	}
+	if n, err := r.PruneSessions(ctx, time.Now().Add(-time.Hour)); err != nil || n != 0 {
+		t.Fatalf("pruned %d fresh rows (%v)", n, err)
+	}
+	if n, err := r.PruneSessions(ctx, time.Now().Add(time.Hour)); err != nil || n != 1 {
+		t.Fatalf("pruned %d rows (%v), want the session alias only", n, err)
+	}
+	if _, err := r.Lookup(ctx, session); !errors.Is(err, ErrNotFound) {
+		t.Errorf("session alias still resolves: %v", err)
+	}
+	for _, id := range []string{version, minted} {
+		if _, err := r.Lookup(ctx, id); err != nil {
+			t.Errorf("%s pruned: %v", id, err)
 		}
 	}
 }

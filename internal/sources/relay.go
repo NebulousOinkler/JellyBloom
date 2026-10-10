@@ -13,6 +13,15 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/NebulousOinkler/JellyBloom/internal/metrics"
+)
+
+var (
+	relayBytes = metrics.Default.NewCounter("jellybloom_relay_bytes_total",
+		"File bytes relayed to clients, by the upstream they came from.", "upstream")
+	relayFailovers = metrics.Default.NewCounter("jellybloom_relay_failovers_total",
+		"Relays that moved to another copy: before the response started, or mid-stream.", "when")
 )
 
 const (
@@ -90,6 +99,7 @@ func (r *Registry) Relay(w http.ResponseWriter, req *http.Request, st Stream) {
 			break
 		}
 		next.close()
+		relayFailovers.Inc("before_response")
 		r.Failed(c, fmt.Sprintf("HTTP %d", code))
 		if code == http.StatusNotFound && status == http.StatusBadGateway {
 			status = http.StatusNotFound
@@ -149,6 +159,7 @@ func (r *Registry) Relay(w http.ResponseWriter, req *http.Request, st Stream) {
 			r.log.Warn("relay ended early: no identical copy to continue from", "source", a.src.String(), "at", pos, "of", total)
 			return
 		}
+		relayFailovers.Inc("mid_stream")
 		r.log.Info("relay failed over", "from", a.src.String(), "to", next.src.String(), "at", pos, "reason", reason)
 		a.close()
 		a = next
@@ -269,6 +280,7 @@ func (r *Registry) copyBody(w http.ResponseWriter, a *attempt, pos *int64, last 
 				return "", true
 			}
 			rc.Flush()
+			relayBytes.Add(float64(n), a.src.Upstream)
 			winWrite += time.Since(t1)
 			*pos += int64(n)
 			winBytes += int64(n)

@@ -1,0 +1,8 @@
+.git
+.github
+data
+bin
+testrig
+docs
+config.yaml
+*.test
