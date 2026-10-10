@@ -283,3 +283,8 @@ A group-owned, self-healing archive for every kind of media (films, shows, music
 audiobooks, books, comics, documents): copy counting against a replication target, adoption
 and surplus plans, repairs by vote. Not started; the plan, phases C0 to C8, and the
 decisions to make first are in [COMMONS.md](COMMONS.md).
+
+## Planned: stacking
+An outer JellyBloom over inner JellyBloom instances, so set operations compose and
+households can sit under a group instance. Deferred; the gaps to close and the test to add
+are in [STACKING.md](STACKING.md).
