@@ -277,3 +277,9 @@ paths for clients.
   deletion records, export and merge (most recent change wins), items matched by match keys;
   admin endpoints and `jellybloom sync`
 - [x] `testrig/travel.py` (19 checks) runs the whole scenario on the rig
+
+## Planned: the Commons
+A group-owned, self-healing archive for every kind of media (films, shows, music,
+audiobooks, books, comics, documents): copy counting against a replication target, adoption
+and surplus plans, repairs by vote. Not started; the plan, phases C0 to C8, and the
+decisions to make first are in [COMMONS.md](COMMONS.md).
