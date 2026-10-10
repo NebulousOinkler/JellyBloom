@@ -61,17 +61,27 @@ type auth struct {
 
 func (p *Proxy) authFor(ctx context.Context, up *upstream.Client, c Caller) (*auth, error) {
 	if d, ok := c.device(up.Name()); ok {
-		tok, err := up.DeviceToken(ctx, d)
+		tok, perDevice, err := up.DeviceToken(ctx, d)
 		if err != nil {
 			return nil, err
 		}
-		return &auth{
-			token:  tok,
-			header: func(t string) string { return up.DeviceAuthHeader(d, t) },
-			reauth: func(ctx context.Context, stale string) error { return up.ReauthDevice(ctx, d, stale) },
-			token2: func(ctx context.Context) (string, error) { return up.DeviceToken(ctx, d) },
-			device: d.ID,
-		}, nil
+		if perDevice {
+			return &auth{
+				token:  tok,
+				header: func(t string) string { return up.DeviceAuthHeader(d, t) },
+				reauth: func(ctx context.Context, stale string) error { return up.ReauthDevice(ctx, d, stale) },
+				token2: func(ctx context.Context) (string, error) {
+					t, _, err := up.DeviceToken(ctx, d)
+					return t, err
+				},
+				device: d.ID,
+			}, nil
+		}
+		// No way to give this client its own upstream session: share ours.
+		if _, warned := p.sharedWarned.LoadOrStore(up.Name(), true); !warned {
+			p.log.Warn("clients share one upstream session (Quick Connect is off and there is no password_file); "+
+				"their sessions and transcodes may interfere", "upstream", up.Name())
+		}
 	}
 	tok, _, err := up.Session(ctx)
 	if err != nil {
@@ -116,6 +126,8 @@ type Proxy struct {
 	hidden   func(string) bool
 	hc       *http.Client
 	log      *slog.Logger
+
+	sharedWarned sync.Map // upstream name -> warned about shared sessions
 
 	mu        sync.Mutex
 	serverIDs map[string]string // upstream name -> upstream server ID

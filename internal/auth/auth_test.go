@@ -78,6 +78,15 @@ func TestSessions(t *testing.T) {
 	if _, u2, err := s.Validate(ctx, sess.Token); err != nil || u2.ID != u.ID {
 		t.Errorf("Validate: %v", err)
 	}
+	// Only a hash is stored: the raw token is nowhere in the database.
+	var stored string
+	s.db.QueryRow(`SELECT token FROM sessions`).Scan(&stored)
+	if stored == sess.Token || stored != hashToken(sess.Token) {
+		t.Errorf("stored session token %q is not the hash of the issued token", stored)
+	}
+	if _, _, err := s.Validate(ctx, stored); !errors.Is(err, ErrUnauthorized) {
+		t.Error("the stored hash itself must not work as a token")
+	}
 
 	// A second login from the same device replaces the first session.
 	sess2, _, _ := s.Authenticate(ctx, "me", "pw", ClientInfo{DeviceID: "dev"})

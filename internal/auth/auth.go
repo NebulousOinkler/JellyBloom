@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -27,6 +28,8 @@ CREATE TABLE IF NOT EXISTS settings (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );
+-- token holds the SHA-256 of the session token: a copied database cannot be
+-- used to log in.
 CREATE TABLE IF NOT EXISTS sessions (
 	token       TEXT PRIMARY KEY,
 	user_id     TEXT NOT NULL,
@@ -153,7 +156,17 @@ func New(db *sql.DB, users []config.User) (*Service, error) {
 	if s.serverID, err = s.setting("server_id", newToken); err != nil {
 		return nil, err
 	}
+	// Sessions from before token hashing stored raw 32-hex tokens; drop them.
+	if _, err := db.Exec(`DELETE FROM sessions WHERE length(token) != 64`); err != nil {
+		return nil, err
+	}
 	return s, nil
+}
+
+// hashToken is how session tokens are stored and looked up.
+func hashToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }
 
 // userID derives a stable 32-hex user ID from the name.
@@ -220,7 +233,7 @@ func (s *Service) Authenticate(ctx context.Context, name, password string, ci Cl
 		}
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		sess.Token, u.ID, sess.DeviceID, sess.DeviceName, sess.Client, sess.Version, now.UnixMilli(), now.UnixMilli())
+		hashToken(sess.Token), u.ID, sess.DeviceID, sess.DeviceName, sess.Client, sess.Version, now.UnixMilli(), now.UnixMilli())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -235,7 +248,7 @@ func (s *Service) Validate(ctx context.Context, token string) (*Session, *User, 
 	sess := &Session{Token: token}
 	var created, seen int64
 	err := s.db.QueryRowContext(ctx, `SELECT user_id, device_id, device_name, client, version, created, last_seen FROM sessions WHERE token = ?`,
-		token).Scan(&sess.UserID, &sess.DeviceID, &sess.DeviceName, &sess.Client, &sess.Version, &created, &seen)
+		hashToken(token)).Scan(&sess.UserID, &sess.DeviceID, &sess.DeviceName, &sess.Client, &sess.Version, &created, &seen)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, ErrUnauthorized
 	}
@@ -261,7 +274,7 @@ func (s *Service) touch(ctx context.Context, token string) {
 	}
 	s.lastSeen[token] = now
 	s.mu.Unlock()
-	s.db.ExecContext(ctx, `UPDATE sessions SET last_seen = ? WHERE token = ?`, now.UnixMilli(), token)
+	s.db.ExecContext(ctx, `UPDATE sessions SET last_seen = ? WHERE token = ?`, now.UnixMilli(), hashToken(token))
 }
 
 // Logout ends a session.
@@ -269,7 +282,7 @@ func (s *Service) Logout(ctx context.Context, token string) error {
 	s.mu.Lock()
 	delete(s.lastSeen, token)
 	s.mu.Unlock()
-	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE token = ?`, token)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE token = ?`, hashToken(token))
 	return err
 }
 

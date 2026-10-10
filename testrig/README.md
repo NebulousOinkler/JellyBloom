@@ -23,6 +23,9 @@ testrig/smoke.py               # drive JellyBloom like a client; PASS/FAIL per c
 testrig/servers.sh stop
 ```
 
-Credentials are generated on first setup and stored in `testrig/data/rig.json`;
+Each server gets a non-admin `jellybloom` account; `setup.py` pairs JellyBloom with it
+through `jellybloom pair` (approving the Quick Connect code via the API), so the generated
+config holds no upstream secrets. Credentials are generated on first setup and stored in
+`testrig/data/rig.json`;
 everything under `testrig/data/` is git-ignored. JellyBloom logs at debug level to
 `testrig/data/jb/jellybloom.log`. `testrig/inspect.py` lists what each server indexed.

@@ -23,31 +23,130 @@ import (
 	"github.com/NebulousOinkler/JellyBloom/internal/config"
 	"github.com/NebulousOinkler/JellyBloom/internal/identity"
 	"github.com/NebulousOinkler/JellyBloom/internal/index"
+	"github.com/NebulousOinkler/JellyBloom/internal/pairing"
 	"github.com/NebulousOinkler/JellyBloom/internal/playback"
 	"github.com/NebulousOinkler/JellyBloom/internal/proxy"
+	"github.com/NebulousOinkler/JellyBloom/internal/redact"
+	"github.com/NebulousOinkler/JellyBloom/internal/secrets"
 	"github.com/NebulousOinkler/JellyBloom/internal/server"
 	"github.com/NebulousOinkler/JellyBloom/internal/upstream"
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "hash-password" {
-		if err := hashPassword(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+	level := slog.LevelInfo
+	if strings.EqualFold(os.Getenv("JELLYBLOOM_LOG"), "debug") {
+		level = slog.LevelDebug
+	}
+	// Every log line passes through credential redaction.
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level, ReplaceAttr: redact.ReplaceAttr})))
+
+	subcommands := map[string]func([]string) error{
+		"hash-password": func([]string) error { return hashPassword() },
+		"pair":          pairCmd,
+		"unpair":        unpairCmd,
+	}
+	if len(os.Args) > 1 {
+		if cmd, ok := subcommands[os.Args[1]]; ok {
+			if err := cmd(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, "error:", redact.String(err.Error()))
+				os.Exit(1)
+			}
+			return
 		}
-		return
 	}
 
 	path := flag.String("config", "config.yaml", "path to config file")
 	flag.Parse()
-	if strings.EqualFold(os.Getenv("JELLYBLOOM_LOG"), "debug") {
-		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	}
 
 	if err := run(*path); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
+}
+
+// prompt reads a line from the terminal, without echo when hidden.
+func prompt(label string, hidden bool) (string, error) {
+	fmt.Fprintf(os.Stderr, "%s: ", label)
+	if hidden && term.IsTerminal(int(os.Stdin.Fd())) {
+		b, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Fprintln(os.Stderr)
+		return string(b), err
+	}
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && line == "" {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// upstreamArg loads the config and finds the upstream named by the one
+// positional argument.
+func upstreamArg(fs *flag.FlagSet, args []string, configPath *string) (*config.Config, config.Upstream, error) {
+	if err := fs.Parse(args); err != nil {
+		return nil, config.Upstream{}, err
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+		return nil, config.Upstream{}, errors.New("expected one upstream name")
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return nil, config.Upstream{}, err
+	}
+	for _, u := range cfg.Upstreams {
+		if u.Name == fs.Arg(0) {
+			return cfg, u, nil
+		}
+	}
+	return nil, config.Upstream{}, fmt.Errorf("no upstream named %q in %s", fs.Arg(0), *configPath)
+}
+
+// pairCmd: jellybloom pair [-config f] [-password | -api-key] NAME
+func pairCmd(args []string) error {
+	fs := flag.NewFlagSet("pair", flag.ContinueOnError)
+	configPath := fs.String("config", "config.yaml", "path to config file")
+	usePassword := fs.Bool("password", false, "pair by entering a password once (it is not stored) instead of Quick Connect")
+	useAPIKey := fs.Bool("api-key", false, "pair with a server API key (admin-level; needs user: and allow_admin: true)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: jellybloom pair [-config FILE] [-password | -api-key] UPSTREAM")
+		fs.PrintDefaults()
+	}
+	cfg, u, err := upstreamArg(fs, args, configPath)
+	if err != nil {
+		return err
+	}
+	mode := pairing.QuickConnect
+	switch {
+	case *usePassword && *useAPIKey:
+		return errors.New("choose one of -password and -api-key")
+	case *usePassword:
+		mode = pairing.Password
+	case *useAPIKey:
+		mode = pairing.APIKey
+	}
+	store, err := secrets.Open(cfg)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	return pairing.Pair(ctx, pairing.Options{Upstream: u, Store: store, Mode: mode, Out: os.Stdout, Prompt: prompt})
+}
+
+// unpairCmd: jellybloom unpair [-config f] NAME
+func unpairCmd(args []string) error {
+	fs := flag.NewFlagSet("unpair", flag.ContinueOnError)
+	configPath := fs.String("config", "config.yaml", "path to config file")
+	fs.Usage = func() { fmt.Fprintln(os.Stderr, "usage: jellybloom unpair [-config FILE] UPSTREAM") }
+	cfg, u, err := upstreamArg(fs, args, configPath)
+	if err != nil {
+		return err
+	}
+	store, err := secrets.Open(cfg)
+	if err != nil {
+		return err
+	}
+	return pairing.Unpair(context.Background(), u, store, os.Stdout)
 }
 
 // hashPassword reads a password (hidden when on a terminal) and prints a
@@ -115,11 +214,29 @@ func run(configPath string) error {
 		return err
 	}
 
+	vault, err := secrets.Open(cfg)
+	if err != nil {
+		return err
+	}
 	var wg sync.WaitGroup
 	var clients []*upstream.Client
 	var web *upstream.Client
 	for _, u := range cfg.Upstreams {
-		client, err := upstream.New(u, upstream.Options{})
+		creds := secrets.Credentials(vault, u)
+		if u.PasswordFile != "" {
+			if warn := secrets.LoosePermissions(u.PasswordFile); warn != "" {
+				slog.Warn("password_file permissions", "upstream", u.Name, "detail", warn)
+			}
+		} else if len(u.TokenCommand) == 0 {
+			if _, err := creds.Load(ctx); errors.Is(err, upstream.ErrNotPaired) {
+				slog.Warn("upstream is not paired; it stays offline until you run the pair command",
+					"upstream", u.Name, "command", "jellybloom pair -config "+configPath+" "+u.Name)
+			}
+		}
+		if u.AllowAdmin {
+			slog.Warn("allow_admin is on: an administrator credential is permitted for this upstream", "upstream", u.Name)
+		}
+		client, err := upstream.New(u, creds, upstream.Options{})
 		if err != nil {
 			return err
 		}

@@ -129,6 +129,9 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	switch {
+	case r.URL.Path == "/Users/Me":
+		writeJSON(w, map[string]any{"Id": f.userID, "Name": "u", "Policy": map[string]any{"IsAdministrator": false}})
+		return
 	case strings.HasSuffix(r.URL.Path, "/PlaybackInfo"):
 		item := strings.Split(r.URL.Path, "/")[2]
 		want := q.Get("MediaSourceId")
@@ -279,7 +282,8 @@ func newEnvWith(t *testing.T, mode identity.Mode, data map[string]library) *env 
 	}
 	var clients []*upstream.Client
 	for _, f := range []*fakeUpstream{e.a, e.b} {
-		c, err := upstream.New(config.Upstream{Name: f.name, URL: f.srv.URL, Username: "u", Password: "p"}, upstream.Options{})
+		creds := upstream.Credentials{Password: func() (string, string, error) { return "u", "p", nil }}
+		c, err := upstream.New(config.Upstream{Name: f.name, URL: f.srv.URL}, creds, upstream.Options{})
 		if err != nil {
 			t.Fatal(err)
 		}

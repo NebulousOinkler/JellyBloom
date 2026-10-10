@@ -68,7 +68,12 @@ func (c *Client) Listen(ctx context.Context, handle func(Event)) error {
 		if connectedFor >= stableConn {
 			attempt = 0
 		}
-		if err := sleep(ctx, c.backoff(attempt)); err != nil {
+		delay := c.backoff(attempt)
+		var ce *CredentialError
+		if errors.As(err, &ce) {
+			delay = max(delay, time.Minute) // needs an operator; don't hammer
+		}
+		if err := sleep(ctx, delay); err != nil {
 			return err
 		}
 	}
@@ -85,7 +90,8 @@ func (c *Client) listenOnce(ctx context.Context, handle func(Event)) (time.Durat
 		HTTPHeader: http.Header{"Authorization": {c.authHeader(token)}},
 	})
 	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusUnauthorized {
+		// Jellyfin answers a revoked token with 403 on the socket (401 elsewhere).
+		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
 			if lerr := c.ensureLogin(ctx, token); lerr != nil {
 				return 0, lerr
 			}

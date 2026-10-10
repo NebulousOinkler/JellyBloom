@@ -2,7 +2,10 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -10,13 +13,26 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Upstream is one Jellyfin server. It holds no secrets: credentials come
+// from pairing (`jellybloom pair NAME`, stored in the secret store), a
+// token_command, or a password_file.
 type Upstream struct {
-	Name     string `yaml:"name"`
-	URL      string `yaml:"url"`
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
-	APIKey   string `yaml:"api_key"`
-	User     string `yaml:"user"` // user to act as when using APIKey
+	Name string `yaml:"name"`
+	URL  string `yaml:"url"`
+	// AllowAdmin permits an administrator account (or an API key, which is
+	// always admin-level). Off by default: JellyBloom blocks admin routes, so
+	// an admin credential only adds risk.
+	AllowAdmin bool `yaml:"allow_admin"`
+	// TokenCommand prints the credential on stdout (argv, no shell), e.g. a
+	// password manager CLI. It yields a user token, or an API key when User
+	// is set.
+	TokenCommand []string `yaml:"token_command"`
+	// User is the account an API key acts as (API-key mode only).
+	User string `yaml:"user"`
+	// PasswordFile and Username are for unattended deployments: the password
+	// is exchanged for a token, which is then kept in the secret store.
+	Username     string `yaml:"username"`
+	PasswordFile string `yaml:"password_file"`
 }
 
 // User is a JellyBloom account. Clients log in to JellyBloom, never to upstreams.
@@ -34,6 +50,7 @@ type Config struct {
 	Subtract    []string   `yaml:"subtract"` // difference: B (one or more upstreams)
 	WebUpstream string     `yaml:"web_upstream"`
 	DataDir     string     `yaml:"data_dir"`
+	SecretStore string     `yaml:"secret_store"` // "file" (default, under data_dir/secrets) or "keychain"
 	Upstreams   []Upstream `yaml:"upstreams"`
 	Users       []User     `yaml:"users"`
 	// FallbackWriteAllow lists extra regexes (matched against the lowercased
@@ -42,14 +59,29 @@ type Config struct {
 	FallbackWriteAllow []string `yaml:"fallback_write_allow"`
 }
 
+var upstreamName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
 func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	c := &Config{Listen: ":8096", ServerName: "JellyBloom", Merge: "union", DataDir: "data"}
-	if err := yaml.Unmarshal(b, c); err != nil {
+	c := &Config{Listen: ":8096", ServerName: "JellyBloom", Merge: "union", DataDir: "data", SecretStore: "file"}
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true) // typos and removed fields are errors, not silently ignored
+	if err := dec.Decode(c); err != nil && !errors.Is(err, io.EOF) {
+		msg := err.Error()
+		for _, removed := range []string{"field password ", "field api_key "} {
+			if strings.Contains(msg, removed) {
+				return nil, fmt.Errorf("%v: upstream secrets no longer go in the config; pair with `jellybloom pair NAME` (or use password_file / token_command)", err)
+			}
+		}
 		return nil, err
+	}
+	switch c.SecretStore {
+	case "file", "keychain":
+	default:
+		return nil, fmt.Errorf("unknown secret_store %q (want file or keychain)", c.SecretStore)
 	}
 	switch c.Merge {
 	case "union", "intersection", "difference":
@@ -68,11 +100,17 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("duplicate upstream name %q", u.Name)
 		}
 		names[u.Name] = true
-		if u.APIKey == "" && u.Username == "" {
-			return nil, fmt.Errorf("upstream %q: need api_key or username/password", u.Name)
+		if !upstreamName.MatchString(u.Name) {
+			return nil, fmt.Errorf("upstream %q: name may only contain letters, digits, '-' and '_'", u.Name)
 		}
-		if u.APIKey != "" && u.User == "" {
-			return nil, fmt.Errorf("upstream %q: api_key requires user", u.Name)
+		if (u.PasswordFile == "") != (u.Username == "") {
+			return nil, fmt.Errorf("upstream %q: username and password_file go together", u.Name)
+		}
+		if u.PasswordFile != "" && len(u.TokenCommand) > 0 {
+			return nil, fmt.Errorf("upstream %q: use either token_command or password_file, not both", u.Name)
+		}
+		if u.User != "" && !u.AllowAdmin {
+			return nil, fmt.Errorf("upstream %q: user (API-key mode) requires allow_admin: true, since Jellyfin API keys are admin keys", u.Name)
 		}
 	}
 	if c.Merge == "difference" {

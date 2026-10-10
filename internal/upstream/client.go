@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/NebulousOinkler/JellyBloom/internal/config"
@@ -47,13 +48,21 @@ type Client struct {
 	baseBackoff time.Duration
 	maxBackoff  time.Duration
 
+	creds Credentials
+
 	loginMu sync.Mutex // serializes logins
 	mu      sync.RWMutex
 	token   string
 	userID  string
+	apiKey  bool // token is an API key
 
 	devMu   sync.Mutex
 	devices map[string]*deviceSession // per-client sessions, by Device.ID
+
+	qcMu          sync.Mutex
+	qcEnabled     bool
+	qcChecked     time.Time
+	sharedDevices atomic.Bool
 }
 
 // StatusError is a non-2xx response from an upstream.
@@ -69,9 +78,9 @@ func (e *StatusError) Error() string {
 	return fmt.Sprintf("upstream %s: %s %s: HTTP %d: %s", e.Upstream, e.Method, e.Path, e.Code, e.Body)
 }
 
-// New creates a client for u. It does not contact the upstream; the first
-// authenticated call (or Login) does.
-func New(u config.Upstream, opts Options) (*Client, error) {
+// New creates a client for u authenticating with creds. It does not contact
+// the upstream; the first authenticated call (or Login) does.
+func New(u config.Upstream, creds Credentials, opts Options) (*Client, error) {
 	base, err := url.Parse(u.URL)
 	if err != nil {
 		return nil, fmt.Errorf("upstream %q: bad url: %w", u.Name, err)
@@ -83,6 +92,7 @@ func New(u config.Upstream, opts Options) (*Client, error) {
 
 	c := &Client{
 		cfg:         u,
+		creds:       creds,
 		base:        base,
 		deviceID:    deviceID(u.Name),
 		hc:          opts.HTTPClient,
@@ -164,7 +174,7 @@ func (c *Client) authHeader(token string) string {
 func (c *Client) Login(ctx context.Context) error {
 	c.loginMu.Lock()
 	defer c.loginMu.Unlock()
-	return c.loginLocked(ctx)
+	return c.loginLocked(ctx, "")
 }
 
 // ensureLogin logs in unless a session exists. If stale is non-empty and still
@@ -176,43 +186,13 @@ func (c *Client) ensureLogin(ctx context.Context, stale string) error {
 	if token != "" && token != stale {
 		return nil // already logged in, or another goroutine re-logged in
 	}
-	return c.loginLocked(ctx)
+	return c.loginLocked(ctx, stale)
 }
 
-func (c *Client) loginLocked(ctx context.Context) error {
-	if c.cfg.APIKey != "" {
-		var users []struct{ Name, Id string }
-		if err := c.send(ctx, http.MethodGet, "/Users", nil, nil, c.cfg.APIKey, &users); err != nil {
-			return fmt.Errorf("upstream %s: list users: %w", c.cfg.Name, err)
-		}
-		for _, u := range users {
-			if strings.EqualFold(u.Name, c.cfg.User) {
-				c.setSession(c.cfg.APIKey, u.Id)
-				return nil
-			}
-		}
-		return fmt.Errorf("upstream %s: user %q not found", c.cfg.Name, c.cfg.User)
-	}
-
-	body := map[string]string{"Username": c.cfg.Username, "Pw": c.cfg.Password}
-	var res struct {
-		AccessToken string
-		User        struct{ Id string }
-	}
-	if err := c.send(ctx, http.MethodPost, "/Users/AuthenticateByName", nil, body, "", &res); err != nil {
-		return fmt.Errorf("upstream %s: login: %w", c.cfg.Name, err)
-	}
-	if res.AccessToken == "" || res.User.Id == "" {
-		return fmt.Errorf("upstream %s: login: response missing token or user", c.cfg.Name)
-	}
-	c.setSession(res.AccessToken, res.User.Id)
-	return nil
-}
-
-func (c *Client) setSession(token, userID string) {
-	c.mu.Lock()
-	c.token, c.userID = token, userID
-	c.mu.Unlock()
+func (c *Client) isAPIKey() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.apiKey
 }
 
 // get performs an authenticated GET, decoding JSON into out (if non-nil).

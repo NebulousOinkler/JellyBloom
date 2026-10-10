@@ -1,8 +1,12 @@
 listen: ":8096"
 server_name: "JellyBloom"
 
-# Holds the metadata index (jellybloom.db). Never contains media or other upstream files.
+# Holds the metadata index (jellybloom.db) and, with the file secret store, upstream
+# tokens under data_dir/secrets (owner-only). Never contains media or other upstream files.
 data_dir: data
+
+# Where paired upstream tokens are kept: file (default) or keychain (OS keychain).
+secret_store: file
 
 # How results from multiple upstreams are combined: union | intersection | difference
 merge: union
@@ -14,15 +18,37 @@ merge: union
 # Upstream that serves the stock jellyfin-web UI at /web (default: first upstream)
 web_upstream: home
 
+# This file holds no upstream secrets. Pair each upstream once:
+#   jellybloom pair -config config.yaml home
+# It prints a Quick Connect code to approve in a Jellyfin app signed in to that server
+# as the account JellyBloom should use. JellyBloom stores only the resulting token,
+# which the server owner can revoke under Dashboard -> Devices. Use a dedicated
+# non-administrator account: admin accounts are refused unless allow_admin is set.
 upstreams:
   - name: home
     url: http://192.168.1.10:8096
-    username: me
-    password: secret
+
   - name: friend
     url: https://jellyfin.example.com
-    api_key: 0123456789abcdef
-    user: guest   # required with api_key
+
+  # Unattended deploys: a password_file is exchanged for a token (kept in the secret
+  # store); the password itself is never logged or stored by JellyBloom.
+  # - name: nas
+  #   url: http://nas.lan:8096
+  #   username: jellybloom
+  #   password_file: /run/secrets/nas-jellyfin
+
+  # Or fetch the token from a password manager (argv, no shell):
+  # - name: cloud
+  #   url: https://cloud.example.com
+  #   token_command: ["op", "read", "op://Media/jellyfin-cloud/token"]
+
+  # API keys are server-wide admin keys; only for your own server, and only opted in:
+  #   jellybloom pair -api-key own
+  # - name: own
+  #   url: http://localhost:8096
+  #   user: jellybloom      # the account API-key requests act as
+  #   allow_admin: true
 
 # JellyBloom's own accounts. Clients log in here; upstream credentials stay private.
 # Generate a hash with: jellybloom hash-password

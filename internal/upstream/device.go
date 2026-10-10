@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 )
@@ -68,29 +70,53 @@ func (c *Client) deviceSession(id string) *deviceSession {
 	return ds
 }
 
-// DeviceToken returns a token for requests made on behalf of d, logging the
-// device in on first use. API-key upstreams use the key, since Jellyfin takes
-// an API key request's device from the header.
-func (c *Client) DeviceToken(ctx context.Context, d Device) (string, error) {
+// errNoDeviceLogin: the upstream offers no way to give d its own session.
+var errNoDeviceLogin = errors.New("no per-device login available")
+
+// DeviceToken returns a token for requests made on behalf of d. perDevice
+// reports whether it is d's own session; when false (no Quick Connect and no
+// fallback password), it is JellyBloom's shared session and requests should
+// use AuthHeader rather than DeviceAuthHeader. API keys serve every device:
+// Jellyfin takes an API key request's device from the header.
+func (c *Client) DeviceToken(ctx context.Context, d Device) (token string, perDevice bool, err error) {
 	if err := c.ensureLogin(ctx, ""); err != nil {
-		return "", err
+		return "", false, err
 	}
-	if c.cfg.APIKey != "" {
-		return c.cfg.APIKey, nil
+	root, uid := c.session()
+	if c.isAPIKey() {
+		return root, true, nil
 	}
 	ds := c.deviceSession(d.ID)
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	if ds.token != "" {
-		return ds.token, nil
+		return ds.token, true, nil
 	}
-	return ds.token, c.loginDevice(ctx, d, ds)
+	tok, err := c.mintDevice(ctx, d, root, uid)
+	if isUnauthorized(err) {
+		// Our own session was rejected (e.g. revoked upstream): re-establish
+		// it, which reports a CredentialError if re-pairing is needed.
+		if err := c.ensureLogin(ctx, root); err != nil {
+			return "", false, err
+		}
+		root, uid = c.session()
+		tok, err = c.mintDevice(ctx, d, root, uid)
+	}
+	if errors.Is(err, errNoDeviceLogin) {
+		return root, false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	ds.token = tok
+	return tok, true, nil
 }
 
-// ReauthDevice discards a device's token if it is still stale and logs in
-// again. API-key upstreams re-check the key's user instead.
+// ReauthDevice replaces d's token if it is still stale (the upstream just
+// rejected it). If minting fails because JellyBloom's own session was
+// revoked, that session is re-established first.
 func (c *Client) ReauthDevice(ctx context.Context, d Device, stale string) error {
-	if c.cfg.APIKey != "" {
+	if c.isAPIKey() {
 		return c.ensureLogin(ctx, stale)
 	}
 	ds := c.deviceSession(d.ID)
@@ -99,21 +125,51 @@ func (c *Client) ReauthDevice(ctx context.Context, d Device, stale string) error
 	if ds.token != "" && ds.token != stale {
 		return nil
 	}
-	return c.loginDevice(ctx, d, ds)
-}
-
-func (c *Client) loginDevice(ctx context.Context, d Device, ds *deviceSession) error {
-	body := map[string]string{"Username": c.cfg.Username, "Pw": c.cfg.Password}
-	var res struct {
-		AccessToken string
-		User        struct{ Id string }
+	ds.token = ""
+	root, uid := c.session()
+	if stale == root { // a shared-session request was rejected
+		return c.ensureLogin(ctx, stale)
 	}
-	if err := c.sendAuth(ctx, http.MethodPost, "/Users/AuthenticateByName", nil, body, c.DeviceAuthHeader(d, ""), &res); err != nil {
-		return fmt.Errorf("upstream %s: device login: %w", c.cfg.Name, err)
+	tok, err := c.mintDevice(ctx, d, root, uid)
+	if isUnauthorized(err) {
+		if err := c.ensureLogin(ctx, root); err != nil {
+			return err
+		}
+		root, uid = c.session()
+		tok, err = c.mintDevice(ctx, d, root, uid)
 	}
-	if res.AccessToken == "" {
-		return fmt.Errorf("upstream %s: device login: no token", c.cfg.Name)
+	if err != nil && !errors.Is(err, errNoDeviceLogin) {
+		return err
 	}
-	ds.token = res.AccessToken
+	ds.token = tok
 	return nil
 }
+
+// mintDevice gives d its own upstream session: through Quick Connect,
+// approved with JellyBloom's own session, or with the fallback password.
+func (c *Client) mintDevice(ctx context.Context, d Device, root, uid string) (string, error) {
+	if c.QuickConnectEnabled(ctx) {
+		q, err := c.startQuickConnect(ctx, c.DeviceAuthHeader(d, ""))
+		if err != nil {
+			return "", err
+		}
+		query := url.Values{"code": {q.Code}, "userId": {uid}}
+		if err := c.send(ctx, http.MethodPost, "/QuickConnect/Authorize", query, nil, root, nil); err != nil {
+			return "", err
+		}
+		return c.finishQuickConnect(ctx, q, c.DeviceAuthHeader(d, ""))
+	}
+	if c.creds.Password != nil {
+		user, pw, err := c.creds.Password()
+		if err != nil {
+			return "", err
+		}
+		return c.exchangePassword(ctx, c.DeviceAuthHeader(d, ""), user, pw)
+	}
+	c.sharedDevices.Store(true)
+	return "", errNoDeviceLogin
+}
+
+// SharedDevices reports whether clients have had to share JellyBloom's own
+// upstream session (Quick Connect off and no fallback password).
+func (c *Client) SharedDevices() bool { return c.sharedDevices.Load() }

@@ -222,6 +222,37 @@ injected plugin scripts and config pages.
 - Installing plugins on JellyBloom itself is out of scope, because that would require
   JellyBloom to be a .NET Jellyfin host.
 
+## Upstream credentials
+
+JellyBloom needs upstream *tokens*, never passwords. Jellyfin tokens do not expire, can
+be revoked per device from the server's dashboard, and do not expose a password that may
+be reused elsewhere.
+
+- **Pairing (default):** `jellybloom pair NAME` starts Quick Connect and prints a code.
+  Someone signed in to that server as the intended account approves it in their Jellyfin
+  app; JellyBloom receives a token and never sees the password. This also suits friends'
+  servers: the friend approves on their side.
+- **Fallbacks:** `pair -password` exchanges a password once (it is not kept);
+  `password_file` does the same unattended; `token_command` reads the credential from a
+  password manager; `pair -api-key` stores a server API key (admin-level, opt-in only).
+- **Secret store:** tokens live outside the config, in owner-only files under
+  `data_dir/secrets` (JellyBloom refuses to start if they are readable by others) or in
+  the OS keychain (`secret_store: keychain`). The config holds no secrets.
+- **Least privilege:** each login checks the account via `/Users/Me`; administrator
+  accounts and API keys are refused unless the upstream sets `allow_admin: true`, at
+  pairing time and at every startup. JellyBloom blocks admin routes anyway, so admin
+  rights only add risk.
+- **Per-client devices:** each (JellyBloom user, client device) gets its own upstream
+  session, minted by approving a Quick Connect code with the paired token. Without Quick
+  Connect it falls back to `password_file`, then to one shared session (with a warning).
+- **Revocation:** re-pairing revokes the token it replaces; `jellybloom unpair NAME`
+  revokes and deletes. If an upstream revokes JellyBloom, requests fail with a clear
+  "re-pair" error (Jellyfin rejects revoked sockets with 403, other calls with 401), and a
+  new pairing is picked up without a restart.
+- **Hygiene:** every log line passes through credential redaction (URL `ApiKey=`,
+  `Token="…"` headers, JSON token/password fields); Go transport errors otherwise embed
+  full URLs. JellyBloom's own session tokens are stored only as SHA-256 hashes.
+
 ## Out of scope (initially)
 - Live TV / DVR
 - SyncPlay

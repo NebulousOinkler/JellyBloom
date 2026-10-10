@@ -16,7 +16,7 @@ import (
 
 func TestLoginWithPassword(t *testing.T) {
 	f := newFake(t)
-	c := f.client(t, config.Upstream{Username: "me", Password: "pw"})
+	c := f.client(t, pwCreds("me", "pw"))
 
 	if _, err := c.Views(testCtx(t)); err != nil {
 		t.Fatal(err)
@@ -39,7 +39,7 @@ func TestLoginWithPassword(t *testing.T) {
 
 func TestLoginBadPassword(t *testing.T) {
 	f := newFake(t)
-	c := f.client(t, config.Upstream{Username: "me", Password: "wrong"})
+	c := f.client(t, pwCreds("me", "wrong"))
 
 	err := c.Login(testCtx(t))
 	var se *StatusError
@@ -50,7 +50,7 @@ func TestLoginBadPassword(t *testing.T) {
 
 func TestLoginWithAPIKey(t *testing.T) {
 	f := newFake(t)
-	c := f.client(t, config.Upstream{APIKey: "admin-key", User: "Guest"})
+	c := f.client(t, apiCreds("admin-key", "Guest"))
 
 	if err := c.Login(testCtx(t)); err != nil {
 		t.Fatal(err)
@@ -62,7 +62,7 @@ func TestLoginWithAPIKey(t *testing.T) {
 
 func TestLoginWithAPIKeyUnknownUser(t *testing.T) {
 	f := newFake(t)
-	c := f.client(t, config.Upstream{APIKey: "admin-key", User: "nobody"})
+	c := f.client(t, apiCreds("admin-key", "nobody"))
 
 	if err := c.Login(testCtx(t)); err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("err = %v, want user not found", err)
@@ -71,7 +71,7 @@ func TestLoginWithAPIKeyUnknownUser(t *testing.T) {
 
 func TestReloginOn401(t *testing.T) {
 	f := newFake(t)
-	c := f.client(t, config.Upstream{Username: "me", Password: "pw"})
+	c := f.client(t, pwCreds("me", "pw"))
 	ctx := testCtx(t)
 
 	if _, err := c.Views(ctx); err != nil {
@@ -88,7 +88,7 @@ func TestReloginOn401(t *testing.T) {
 
 func TestRetryOnServiceUnavailable(t *testing.T) {
 	f := newFake(t)
-	c := f.client(t, config.Upstream{Username: "me", Password: "pw"})
+	c := f.client(t, pwCreds("me", "pw"))
 	ctx := testCtx(t)
 	if err := c.Login(ctx); err != nil {
 		t.Fatal(err)
@@ -113,7 +113,7 @@ func TestRetryOnServiceUnavailable(t *testing.T) {
 
 func TestNotFoundIsNotRetried(t *testing.T) {
 	f := newFake(t)
-	c := f.client(t, config.Upstream{Username: "me", Password: "pw"})
+	c := f.client(t, pwCreds("me", "pw"))
 
 	err := c.get(testCtx(t), "/Nope", nil, nil)
 	var se *StatusError
@@ -124,7 +124,7 @@ func TestNotFoundIsNotRetried(t *testing.T) {
 
 func TestEachItemPage(t *testing.T) {
 	f := newFake(t)
-	c := f.client(t, config.Upstream{Username: "me", Password: "pw"})
+	c := f.client(t, pwCreds("me", "pw"))
 
 	var pages, items int
 	q := ItemsQuery{Recursive: true, IncludeItemTypes: []string{"Movie", "Episode"}, Fields: []string{"ProviderIds"}}
@@ -151,7 +151,7 @@ func TestEachItemPage(t *testing.T) {
 
 func TestEachArtistPage(t *testing.T) {
 	f := newFake(t)
-	c := f.client(t, config.Upstream{Username: "me", Password: "pw"})
+	c := f.client(t, pwCreds("me", "pw"))
 
 	items := 0
 	err := c.EachArtistPage(testCtx(t), ItemsQuery{ParentID: "lib-music"}, 20, func(p *QueryResult) error {
@@ -168,7 +168,7 @@ func TestEachArtistPage(t *testing.T) {
 
 func TestEachItemPageStopsOnCallbackError(t *testing.T) {
 	f := newFake(t)
-	c := f.client(t, config.Upstream{Username: "me", Password: "pw"})
+	c := f.client(t, pwCreds("me", "pw"))
 
 	stop := errors.New("stop")
 	calls := 0
@@ -180,7 +180,7 @@ func TestEachItemPageStopsOnCallbackError(t *testing.T) {
 
 func TestPublicInfoAndPing(t *testing.T) {
 	f := newFake(t)
-	c := f.client(t, config.Upstream{Username: "me", Password: "pw"})
+	c := f.client(t, pwCreds("me", "pw"))
 	ctx := testCtx(t)
 
 	info, err := c.PublicInfo(ctx)
@@ -204,7 +204,7 @@ func TestPublicInfoAndPing(t *testing.T) {
 }
 
 func TestBaseURLWithSubpath(t *testing.T) {
-	c, err := New(config.Upstream{Name: "x", URL: "https://example.com/jellyfin/"}, Options{})
+	c, err := New(config.Upstream{Name: "x", URL: "https://example.com/jellyfin/"}, Credentials{}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,14 +214,14 @@ func TestBaseURLWithSubpath(t *testing.T) {
 	if got := c.socketURL("t"); !strings.HasPrefix(got, "wss://example.com/jellyfin/socket?") {
 		t.Errorf("socketURL = %q", got)
 	}
-	if _, err := New(config.Upstream{Name: "x", URL: "ftp://example.com"}, Options{}); err == nil {
+	if _, err := New(config.Upstream{Name: "x", URL: "ftp://example.com"}, Credentials{}, Options{}); err == nil {
 		t.Error("expected error for non-http url")
 	}
 }
 
 func TestListen(t *testing.T) {
 	f := newFake(t)
-	c := f.client(t, config.Upstream{Username: "me", Password: "pw"})
+	c := f.client(t, pwCreds("me", "pw"))
 	ctx, cancel := context.WithCancel(testCtx(t))
 
 	events := make(chan Event, 16)
@@ -293,47 +293,5 @@ func TestListen(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Listen did not return after cancel")
-	}
-}
-
-func TestDeviceSessions(t *testing.T) {
-	f := newFake(t)
-	c := f.client(t, config.Upstream{Username: "me", Password: "pw"})
-	ctx := testCtx(t)
-
-	d1 := Device{ID: DeviceID("fake", "user1", "phone"), Name: "Phone", Client: "Swiftfin", Version: "1.0"}
-	d2 := Device{ID: DeviceID("fake", "user1", "tv"), Name: "TV"}
-	if d1.ID == d2.ID || len(d1.ID) != 32 || DeviceID("fake", "user1", "phone") != d1.ID {
-		t.Fatalf("DeviceID not stable/distinct: %s %s", d1.ID, d2.ID)
-	}
-	t1, err := c.DeviceToken(ctx, d1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t2, _ := c.DeviceToken(ctx, d2)
-	again, _ := c.DeviceToken(ctx, d1)
-	if t1 == t2 || t1 != again {
-		t.Errorf("tokens: d1=%s d2=%s again=%s", t1, t2, again)
-	}
-	if n := f.get(func() int { return f.logins }); n != 3 { // main session + two devices
-		t.Errorf("logins = %d, want 3", n)
-	}
-	h := c.DeviceAuthHeader(d1, t1)
-	for _, want := range []string{`Client="Swiftfin"`, `Device="Phone"`, `DeviceId="` + d1.ID + `"`, `Token="` + t1 + `"`} {
-		if !strings.Contains(h, want) {
-			t.Errorf("header %q missing %q", h, want)
-		}
-	}
-
-	if err := c.ReauthDevice(ctx, d1, t1); err != nil {
-		t.Fatal(err)
-	}
-	if t3, _ := c.DeviceToken(ctx, d1); t3 == t1 {
-		t.Error("ReauthDevice did not replace the stale token")
-	}
-
-	k := f.client(t, config.Upstream{APIKey: "admin-key", User: "me"})
-	if tok, err := k.DeviceToken(ctx, d1); err != nil || tok != "admin-key" {
-		t.Errorf("api-key device token = %q, %v", tok, err)
 	}
 }

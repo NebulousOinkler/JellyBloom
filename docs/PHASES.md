@@ -116,6 +116,20 @@ with the "done when" check from that table. Target upstream version: Jellyfin 10
   name, so same-named libraries share IDs across servers; item IDs differ. URLs use dashed
   GUIDs.
 
+## Phase 6.5: Upstream credentials (`internal/secrets`, `internal/pairing`, `internal/redact`)
+- [x] Config holds no upstream secrets; strict decoding rejects removed/unknown fields
+- [x] `jellybloom pair` via Quick Connect (default), `-password` (exchanged once), `-api-key` (opt-in);
+  `jellybloom unpair` revokes and deletes; re-pairing revokes the replaced token
+- [x] Secret store: owner-only files (startup refuses loose permissions) or OS keychain;
+  `token_command` and `password_file` sources
+- [x] Admin accounts and API keys refused unless `allow_admin`, at pairing and every login
+- [x] Per-client upstream devices minted through Quick Connect; fallbacks with warning
+- [x] Log redaction for every line; JellyBloom session tokens stored hashed
+- [x] Verified on the rig: pairing as a non-admin account, upstream-side revocation, a clear
+  "re-pair" error with back-off, and live recovery after re-pairing
+- Later (phase 9 or beyond): per-person pairing, so each JellyBloom user's own upstream
+  account and permissions apply
+
 ## Phase 7: User state (`internal/userdata`)
 - [ ] Played, favorite, resume position, play count; both route styles
 - [ ] `/Items/Resume`, `/Shows/NextUp`

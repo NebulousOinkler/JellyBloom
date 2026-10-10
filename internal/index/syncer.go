@@ -252,7 +252,6 @@ func (s *Syncer) FullSync(ctx context.Context) (err error) {
 	seen := map[string]bool{}
 	folders := map[string]string{} // folder -> parent
 
-
 	items := 0
 	for _, v := range headers {
 		put := func(p *upstream.QueryResult) error {
