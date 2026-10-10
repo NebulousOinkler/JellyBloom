@@ -173,7 +173,8 @@ def main():
     st, _, movies = req(f"/Users/{uid}/Items?ParentId={lib['Movies']['Id']}&Recursive=true&IncludeItemTypes=Movie"
                         "&SortBy=SortName&Fields=PrimaryImageAspectRatio,ProviderIds", tok)
     mnames = [m["Name"] for m in movies["Items"]]
-    check("movies deduplicated across servers", sorted(mnames) == ["Colour Bars (1971)", "Long Test Pattern", "Night of the Test Pattern"], mnames)
+    check("movies deduplicated across servers", sorted(mnames) == ["Colour Bars (1971)", "Damaged Pattern", "Long Test Pattern",
+                                                                   "Night of the Test Pattern", "Truncated Pattern"], mnames)
     no_leaks("movie list", movies, leaks)
     shared = next(m for m in movies["Items"] if m["Name"] == "Night of the Test Pattern")
     long_movie = next((m for m in movies["Items"] if m["Name"] == "Long Test Pattern"), None)

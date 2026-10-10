@@ -2,6 +2,7 @@
 # Starts or stops the two local Jellyfin test servers (localhost only) and,
 # once testrig/setup.py has written its config, JellyBloom in front of them.
 #   testrig/servers.sh start | stop | status | restart-jb
+#   testrig/servers.sh stop-server a|b | start-server a|b   (simulate an upstream outage)
 set -eu
 JF=${JELLYFIN:-/Applications/Jellyfin.app/Contents/MacOS/jellyfin}
 WEB=${JELLYFIN_WEB:-/Applications/Jellyfin.app/Contents/Resources/jellyfin-web}
@@ -57,6 +58,12 @@ case "${1:-}" in
 	start) start a 8201; start b 8202; start_jb ;;
 	stop) stop ;;
 	restart-jb) kill "$(cat "$ROOT/jb/pid" 2>/dev/null)" 2>/dev/null || true; sleep 1; start_jb ;;
+	stop-server)
+		d="$ROOT/jf-${2:?usage: $0 stop-server a|b}"
+		[ -f "$d/pid" ] && kill "$(cat "$d/pid")" 2>/dev/null && echo "stopped jf-$2" || echo "jf-$2 not running"
+		rm -f "$d/pid" ;;
+	start-server)
+		case "${2:-}" in a) start a 8201 ;; b) start b 8202 ;; *) echo "usage: $0 start-server a|b" >&2; exit 2 ;; esac ;;
 	status) for p in 8201 8202 8200; do printf '%s: ' $p; curl -s -m 2 http://127.0.0.1:$p/System/Info/Public || echo down; echo; done ;;
-	*) echo "usage: $0 start|stop|status" >&2; exit 2 ;;
+	*) echo "usage: $0 start|stop|status|restart-jb|stop-server a|b|start-server a|b" >&2; exit 2 ;;
 esac

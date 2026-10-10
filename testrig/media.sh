@@ -1,8 +1,8 @@
 #!/bin/sh
 # Generates synthetic test media with Jellyfin's bundled ffmpeg (nothing is
 # downloaded). Server A gets movies and shows; server B gets music, an
-# audiobook, and movies byte-identical to two of A's. Idempotent: existing
-# files are kept, missing ones are generated.
+# audiobook, movies byte-identical to two of A's, and broken copies of two
+# more. Idempotent: existing files are kept, missing ones are generated.
 set -eu
 FF=${FFMPEG:-/Applications/Jellyfin.app/Contents/MacOS/ffmpeg}
 D=$(cd "$(dirname "$0")" && pwd)/data/media
@@ -15,6 +15,14 @@ video() { # out seconds size pattern
 	mkdir -p "$(dirname "$1")"
 	"$FF" -nostdin -loglevel error -y -f lavfi -i "$4=size=$3:rate=24:duration=$2" \
 		-f lavfi -i "sine=frequency=440:duration=$2" -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+		-c:a aac -b:a 96k -shortest "$1"
+}
+video_cbr() { # out seconds size pattern kbps: constant bitrate, so the file has a predictable size
+	[ -f "$1" ] && return
+	mkdir -p "$(dirname "$1")"
+	"$FF" -nostdin -loglevel error -y -f lavfi -i "$4=size=$3:rate=24:duration=$2" \
+		-f lavfi -i "sine=frequency=440:duration=$2" -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+		-b:v "$5k" -minrate "$5k" -maxrate "$5k" -bufsize "$(($5 * 2))k" -x264-params nal-hrd=cbr \
 		-c:a aac -b:a 96k -shortest "$1"
 }
 track() { # out seconds freq artist album title n year
@@ -59,6 +67,29 @@ long="Long Test Pattern (2001)"
 video "$D/a/movies/$long/$long.mkv" 600 640x360 testsrc2
 nfo "$D/a/movies/$long/$long.nfo" "Long Test Pattern" 2001 999002
 share "$long"
+
+# Broken copies, for routing around broken files: B's "Damaged Pattern" has
+# the same size but 1 MiB zeroed mid-file (bit rot a first/last-MB hash
+# misses); B's "Truncated Pattern" is cut at 60% (its header still claims the
+# full runtime).
+damaged="Damaged Pattern (2005)"
+video_cbr "$D/a/movies/$damaged/$damaged.mkv" 120 640x360 smptehdbars 4000
+nfo "$D/a/movies/$damaged/$damaged.nfo" "Damaged Pattern" 2005 999003
+share "$damaged"
+f="$D/b/movies/$damaged/$damaged.mkv"
+if [ ! -f "$D/b/movies/$damaged/.damaged" ]; then
+	dd if=/dev/zero of="$f" bs=1048576 seek=$(($(stat -f%z "$f") / 2 / 1048576)) count=1 conv=notrunc 2>/dev/null
+	touch "$D/b/movies/$damaged/.damaged"
+fi
+truncated="Truncated Pattern (2006)"
+video "$D/a/movies/$truncated/$truncated.mkv" 120 640x360 pal75bars
+nfo "$D/a/movies/$truncated/$truncated.nfo" "Truncated Pattern" 2006 999004
+share "$truncated"
+f="$D/b/movies/$truncated/$truncated.mkv"
+if [ ! -f "$D/b/movies/$truncated/.truncated" ]; then
+	head -c $(($(stat -f%z "$f") * 6 / 10)) "$f" > "$f.part" && mv "$f.part" "$f"
+	touch "$D/b/movies/$truncated/.truncated"
+fi
 
 show="$D/a/shows/Test Show"
 video "$show/Season 01/Test Show S01E01.mkv" 15 1280x720 testsrc

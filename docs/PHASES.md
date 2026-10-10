@@ -178,12 +178,43 @@ and diffs the results; it found the first group, the rig the rest.
 - Not done: importing existing watch history from upstream accounts; playlist sharing
 
 ## Phase 8: Redundancy (`internal/sources`)
-- [ ] Partial content hashing, streamed, storing only the digest
-- [ ] Throughput and latency stats per upstream from relays and probes
-- [ ] Byte-level failover across identical sources mid-relay
-- [ ] HLS failover: restart the transcode on the next source at the current position
-- [ ] Health tracking, quarantine, and backoff re-checks
-- [ ] Redundancy report endpoint (admin)
+- [ ] Rig: a fault-injecting proxy in front of server b (throttle, latency, cut a body
+  after N bytes, 5xx on media routes), so failover is testable on demand
+- [ ] Source registry: each version's sources with digest, health, and stats; digests and
+  health persisted in SQLite, stats in memory
+- [ ] Content identity: size plus a partial digest (first and last few MB, plus sampled
+  blocks across the file), streamed through the hash, storing only the digest; versions
+  split when digests differ
+- [ ] Throughput and latency stats per upstream from relays (and light probes)
+- [ ] Ranking: health, then measured speed, then config order, applied per PlaybackInfo
+- [ ] Active source per play session, so streams, segments, and reports follow failover
+- [ ] Byte-level failover across identical sources mid-relay (error, stall, or short body:
+  reissue the Range from the current offset to the next source)
+- [ ] HLS failover: Jellyfin produces any segment on demand, so the next source's transcode
+  serves the same segment numbers
+- [ ] Health tracking, quarantine, and backoff re-checks; a truncated or damaged copy is
+  quarantined and its duplicate version hidden
+- [ ] Redundancy report (admin): single-copy items and quarantined sources
+
+Rig scenarios ready (`testrig/media.sh`, `testrig/servers.sh stop-server|start-server`):
+- *Long Test Pattern*: 10 minutes, byte-identical on a and b: byte-level and HLS failover
+  (stop b mid-play; playback must continue from a)
+- *Damaged Pattern*: same size on both, b's copy has 1 MiB zeroed mid-file. Today it is
+  one version with two sources, so failover could splice damaged bytes; first/last-MB
+  hashes alone do not catch it
+- *Truncated Pattern*: b's copy cut at 60% but its header still claims the full runtime.
+  Today it shows as a confusing second version, "360p H264 (2)"
+- Baseline: with b stopped, PlaybackInfo answers at once from a; when b returns, its
+  copies come back
+
+Decisions needed before starting (recommendations first):
+1. Integrity checking: sampled-block digests plus block hashes taken during playback
+   relays (no extra traffic) / first-and-last-MB only (misses mid-file damage) / full
+   background hashing (reads whole libraries over the network)
+2. Speed measurement: passive from real playback plus latency pings / also periodic
+   range-read probes (extra upstream traffic)
+3. Redundancy report: admin-only JSON endpoint plus `jellybloom report` CLI / log only
+4. A broken copy that is the only copy: keep serving it and report it / hide it
 
 ## Phase 9: Set operations and hardening
 - [ ] Integration tests for intersection and difference
