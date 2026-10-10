@@ -295,3 +295,45 @@ func TestListen(t *testing.T) {
 		t.Fatal("Listen did not return after cancel")
 	}
 }
+
+func TestDeviceSessions(t *testing.T) {
+	f := newFake(t)
+	c := f.client(t, config.Upstream{Username: "me", Password: "pw"})
+	ctx := testCtx(t)
+
+	d1 := Device{ID: DeviceID("fake", "user1", "phone"), Name: "Phone", Client: "Swiftfin", Version: "1.0"}
+	d2 := Device{ID: DeviceID("fake", "user1", "tv"), Name: "TV"}
+	if d1.ID == d2.ID || len(d1.ID) != 32 || DeviceID("fake", "user1", "phone") != d1.ID {
+		t.Fatalf("DeviceID not stable/distinct: %s %s", d1.ID, d2.ID)
+	}
+	t1, err := c.DeviceToken(ctx, d1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t2, _ := c.DeviceToken(ctx, d2)
+	again, _ := c.DeviceToken(ctx, d1)
+	if t1 == t2 || t1 != again {
+		t.Errorf("tokens: d1=%s d2=%s again=%s", t1, t2, again)
+	}
+	if n := f.get(func() int { return f.logins }); n != 3 { // main session + two devices
+		t.Errorf("logins = %d, want 3", n)
+	}
+	h := c.DeviceAuthHeader(d1, t1)
+	for _, want := range []string{`Client="Swiftfin"`, `Device="Phone"`, `DeviceId="` + d1.ID + `"`, `Token="` + t1 + `"`} {
+		if !strings.Contains(h, want) {
+			t.Errorf("header %q missing %q", h, want)
+		}
+	}
+
+	if err := c.ReauthDevice(ctx, d1, t1); err != nil {
+		t.Fatal(err)
+	}
+	if t3, _ := c.DeviceToken(ctx, d1); t3 == t1 {
+		t.Error("ReauthDevice did not replace the stale token")
+	}
+
+	k := f.client(t, config.Upstream{APIKey: "admin-key", User: "me"})
+	if tok, err := k.DeviceToken(ctx, d1); err != nil || tok != "admin-key" {
+		t.Errorf("api-key device token = %q, %v", tok, err)
+	}
+}

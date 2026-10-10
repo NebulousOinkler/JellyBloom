@@ -23,6 +23,7 @@ import (
 	"github.com/NebulousOinkler/JellyBloom/internal/config"
 	"github.com/NebulousOinkler/JellyBloom/internal/identity"
 	"github.com/NebulousOinkler/JellyBloom/internal/index"
+	"github.com/NebulousOinkler/JellyBloom/internal/playback"
 	"github.com/NebulousOinkler/JellyBloom/internal/proxy"
 	"github.com/NebulousOinkler/JellyBloom/internal/server"
 	"github.com/NebulousOinkler/JellyBloom/internal/upstream"
@@ -171,6 +172,7 @@ func run(configPath string) error {
 		Auth:       authSvc,
 		Proxy:      px,
 		Catalog:    cat,
+		Playback:   playback.New(px, resolver, nil),
 		Version: func(ctx context.Context) (string, error) {
 			info, err := web.PublicInfo(ctx)
 			if err != nil {

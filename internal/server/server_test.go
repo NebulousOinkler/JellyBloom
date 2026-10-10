@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	"github.com/NebulousOinkler/JellyBloom/internal/config"
 	"github.com/NebulousOinkler/JellyBloom/internal/identity"
 	"github.com/NebulousOinkler/JellyBloom/internal/index"
+	"github.com/NebulousOinkler/JellyBloom/internal/playback"
 	"github.com/NebulousOinkler/JellyBloom/internal/proxy"
 	"github.com/NebulousOinkler/JellyBloom/internal/upstream"
 )
@@ -47,12 +49,36 @@ type fakeUpstream struct {
 	mu      sync.Mutex
 	logins  int
 	token   string
+	valid   map[string]bool // issued, unrevoked tokens
 	last    *http.Request
 	lastRaw []byte
+	history []recorded
+	media   map[string][]map[string]any // real item ID -> PlaybackInfo media sources
+}
+
+type recorded struct {
+	method, path string
+	query        url.Values
+	body, auth   string
+}
+
+var deviceRe = regexp.MustCompile(`DeviceId="([^"]*)"`)
+
+// find returns recorded requests whose path ends with suffix.
+func (f *fakeUpstream) find(suffix string) []recorded {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []recorded
+	for _, r := range f.history {
+		if strings.HasSuffix(strings.ToLower(r.path), strings.ToLower(suffix)) {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func newFakeUpstream(t *testing.T, name string) *fakeUpstream {
-	f := &fakeUpstream{name: name, userID: hexID("f" + name), server: hexID("5" + name)}
+	f := &fakeUpstream{name: name, userID: hexID("f" + name), server: hexID("5" + name), valid: map[string]bool{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -65,6 +91,7 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/Users/AuthenticateByName" && r.URL.Path != "/System/Info/Public" {
 		f.mu.Lock()
 		f.last, f.lastRaw = r, body
+		f.history = append(f.history, recorded{r.Method, r.URL.Path, r.URL.Query(), string(body), r.Header.Get("Authorization")})
 		f.mu.Unlock()
 	}
 
@@ -73,6 +100,7 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.logins++
 		f.token = hexID(fmt.Sprintf("%s%d", "c"+f.name, f.logins))
+		f.valid[f.token] = true
 		tok := f.token
 		f.mu.Unlock()
 		writeJSON(w, map[string]any{"AccessToken": tok, "User": map[string]any{"Id": f.userID}})
@@ -86,12 +114,47 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	f.mu.Lock()
-	tok := f.token
-	f.mu.Unlock()
 	m := tokenRe.FindStringSubmatch(r.Header.Get("Authorization"))
-	if m == nil || m[1] != tok {
+	f.mu.Lock()
+	ok := m != nil && f.valid[m[1]]
+	f.mu.Unlock()
+	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	tok := m[1]
+	device := ""
+	if d := deviceRe.FindStringSubmatch(r.Header.Get("Authorization")); d != nil {
+		device = d[1]
+	}
+	q := r.URL.Query()
+	switch {
+	case strings.HasSuffix(r.URL.Path, "/PlaybackInfo"):
+		item := strings.Split(r.URL.Path, "/")[2]
+		want := q.Get("MediaSourceId")
+		var sources []map[string]any
+		for _, ms := range f.media[item] {
+			if want != "" && ms["Id"] != want {
+				continue
+			}
+			c := map[string]any{}
+			for k, v := range ms {
+				c[k] = v
+			}
+			c["TranscodingUrl"] = fmt.Sprintf("/videos/%s/master.m3u8?DeviceId=%s&MediaSourceId=%s&PlaySessionId=%s&api_key=%s",
+				item, device, ms["Id"], hexID("9"+f.name), tok)
+			sources = append(sources, c)
+		}
+		writeJSON(w, map[string]any{"MediaSources": sources, "PlaySessionId": hexID("9" + f.name)})
+		return
+	case strings.HasSuffix(r.URL.Path, "/master.m3u8"):
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		fmt.Fprintf(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nmain.m3u8?DeviceId=%s&MediaSourceId=%s&PlaySessionId=%s&api_key=%s\n",
+			q.Get("DeviceId"), q.Get("MediaSourceId"), q.Get("PlaySessionId"), tok)
+		return
+	case strings.Contains(r.URL.Path, "/hls1/"):
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Write([]byte("SEGMENT " + f.name))
 		return
 	}
 	if strings.HasSuffix(r.URL.Path, "/stream") {
@@ -126,7 +189,7 @@ func (f *fakeUpstream) lastRequest() (*http.Request, string) {
 
 func (f *fakeUpstream) revoke() {
 	f.mu.Lock()
-	f.token = "revoked"
+	f.valid = map[string]bool{}
 	f.mu.Unlock()
 }
 
@@ -235,6 +298,7 @@ func newEnvWith(t *testing.T, mode identity.Mode, data map[string]library) *env 
 		t.Fatal(err)
 	}
 	e.server, err = New(Options{ServerName: "Bloom", DB: idx.DB(), Auth: e.auth, Proxy: px, Catalog: cat,
+		Playback: playback.New(px, e.res, nil),
 		Version: func(ctx context.Context) (string, error) {
 			info, err := clients[1].PublicInfo(ctx)
 			if err != nil {
@@ -395,8 +459,13 @@ func TestFallbackRoutingAndRewriting(t *testing.T) {
 	if q := upReq.URL.Query().Get("userId"); q != e.a.userID {
 		t.Errorf("userId not mapped to upstream user: %q", q)
 	}
-	if auth := upReq.Header.Get("Authorization"); strings.Contains(auth, e.token) || !strings.Contains(auth, `Client="JellyBloom"`) {
-		t.Errorf("upstream got client credentials: %q", auth)
+	// The upstream sees the client's app as its own device (so sessions and
+	// transcodes of different clients stay apart), never JellyBloom's token or
+	// the client's raw device ID.
+	auth := upReq.Header.Get("Authorization")
+	wantDevice := upstream.DeviceID("a", e.userID, "dev1")
+	if strings.Contains(auth, e.token) || strings.Contains(auth, `"dev1"`) || !strings.Contains(auth, `DeviceId="`+wantDevice+`"`) {
+		t.Errorf("upstream auth = %q", auth)
 	}
 
 	// The response carries only JellyBloom IDs, URLs, and tokens.
@@ -680,5 +749,141 @@ func TestMilestoneMusicAndVideo(t *testing.T) {
 	}
 	if r := e.do("GET", "/Users/"+hexID("99")+"/Items", e.token, nil); r.code != 403 {
 		t.Errorf("other user's items = %d", r.code)
+	}
+}
+
+func mediaSource(id, codec string, w, h, size int) map[string]any {
+	return map[string]any{
+		"Id": id, "Container": "mkv", "Size": size, "RunTimeTicks": 72_000_000_000, "Bitrate": size * 8,
+		"SupportsDirectPlay": true, "SupportsDirectStream": true, "SupportsTranscoding": true, "Protocol": "File",
+		"Name": "upstream file name", "MediaStreams": []map[string]any{
+			{"Type": "Video", "Codec": codec, "Width": w, "Height": h}, {"Type": "Audio", "Codec": "aac", "Channels": 2}},
+	}
+}
+
+func TestPlayback(t *testing.T) {
+	e := newEnv(t, identity.Mode{})
+	a4k := hexID("a4c")
+	e.a.media = map[string][]map[string]any{shared["a"]: {
+		mediaSource(shared["a"], "h264", 1920, 1080, 100), mediaSource(a4k, "hevc", 3840, 2160, 500)}}
+	e.b.media = map[string][]map[string]any{
+		shared["b"]: {mediaSource(shared["b"], "h264", 1920, 1080, 100)}, // identical to a's 1080p file
+		bOnly:       {mediaSource(bOnly, "h264", 1280, 720, 50)},
+	}
+	e.login()
+	item := e.uid("a", shared["a"])
+
+	r := e.do("POST", "/Items/"+item+"/PlaybackInfo?userId="+e.userID, e.token, map[string]any{"UserId": e.userID, "DeviceProfile": map[string]any{}})
+	if r.code != 200 {
+		t.Fatalf("PlaybackInfo = %d %s", r.code, r.body)
+	}
+	info := r.json(t)
+	psid := info["PlaySessionId"].(string)
+	srcs := info["MediaSources"].([]any)
+	if len(srcs) != 2 {
+		t.Fatalf("want 2 versions (4K, 1080p shared by a and b), got %s", r.body)
+	}
+	v4k, v1080 := srcs[0].(map[string]any), srcs[1].(map[string]any)
+	if v4k["Name"] != "4K HEVC" || v1080["Name"] != "1080p H264" {
+		t.Errorf("version names = %v, %v", v4k["Name"], v1080["Name"])
+	}
+	if v4k["Id"] == item || v1080["Id"] == item || v4k["Id"] == v1080["Id"] {
+		t.Errorf("version ids = %v %v", v4k["Id"], v1080["Id"])
+	}
+	for _, leak := range []string{shared["a"], shared["b"], a4k, hexID("9a"), hexID("9b"), "upstream file name",
+		upstream.DeviceID("a", e.userID, "dev1"), e.a.userID, e.b.userID} {
+		if bytes.Contains(r.body, []byte(leak)) {
+			t.Errorf("PlaybackInfo leaks %q", leak)
+		}
+	}
+	// Both upstreams were asked, as their own user, about their own copy.
+	for _, f := range []*fakeUpstream{e.a, e.b} {
+		reqs := f.find("/PlaybackInfo")
+		if len(reqs) != 1 || reqs[0].path != "/Items/"+shared[f.name]+"/PlaybackInfo" || reqs[0].query.Get("userId") != f.userID ||
+			!strings.Contains(reqs[0].body, f.userID) {
+			t.Errorf("%s PlaybackInfo requests = %+v", f.name, reqs)
+		}
+	}
+
+	// The transcoding URL names only JellyBloom IDs, the client's token and device.
+	tu, _ := url.Parse(v1080["TranscodingUrl"].(string))
+	tq := tu.Query()
+	if tu.Path != "/videos/"+item+"/master.m3u8" || tq.Get("MediaSourceId") != v1080["Id"] || tq.Get("PlaySessionId") != psid ||
+		tq.Get("api_key") != e.token || tq.Get("DeviceId") != "dev1" {
+		t.Errorf("TranscodingUrl = %s", tu)
+	}
+
+	// Master playlist: routed to a (preferred source), with a's real IDs.
+	pl := e.do("GET", tu.String(), "", nil)
+	reqs := e.a.find("/master.m3u8")
+	if pl.code != 200 || len(reqs) != 1 {
+		t.Fatalf("master playlist = %d, a saw %d requests", pl.code, len(reqs))
+	}
+	got := reqs[0]
+	if got.path != "/videos/"+shared["a"]+"/master.m3u8" || got.query.Get("MediaSourceId") != shared["a"] ||
+		got.query.Get("PlaySessionId") != hexID("9a") || got.query.Get("DeviceId") != upstream.DeviceID("a", e.userID, "dev1") {
+		t.Errorf("a got %s %v", got.path, got.query)
+	}
+	if !strings.Contains(got.auth, `DeviceId="`+upstream.DeviceID("a", e.userID, "dev1")+`"`) {
+		t.Errorf("upstream auth device = %s", got.auth)
+	}
+	body := string(pl.body)
+	if !strings.Contains(body, "PlaySessionId="+psid) || !strings.Contains(body, "api_key="+e.token) ||
+		!strings.Contains(body, "DeviceId=dev1") || strings.Contains(body, hexID("9a")) || strings.Contains(body, shared["a"]) {
+		t.Errorf("playlist not rewritten: %s", body)
+	}
+
+	// Segments relay from the same upstream.
+	seg := e.do("GET", "/videos/"+item+"/hls1/main/0.mp4?MediaSourceId="+item+"&PlaySessionId="+psid+"&api_key="+e.token, "", nil)
+	if string(seg.body) != "SEGMENT a" {
+		t.Errorf("segment = %d %q", seg.code, seg.body)
+	}
+
+	// Direct play of the 4K version goes to a with a's 4K media source.
+	e.do("GET", "/Videos/"+item+"/stream?static=true&MediaSourceId="+v4k["Id"].(string)+"&api_key="+e.token+"&DeviceId=dev1", "", nil)
+	if reqs := e.a.find("/stream"); len(reqs) != 1 || reqs[0].query.Get("MediaSourceId") != a4k {
+		t.Errorf("4K stream requests = %+v", reqs)
+	}
+
+	// Transcode cleanup and progress reports reach a with a's IDs.
+	e.do("DELETE", "/Videos/ActiveEncodings?DeviceId=dev1&PlaySessionId="+psid, e.token, nil)
+	if reqs := e.a.find("/ActiveEncodings"); len(reqs) != 1 || reqs[0].query.Get("PlaySessionId") != hexID("9a") ||
+		reqs[0].query.Get("DeviceId") != upstream.DeviceID("a", e.userID, "dev1") {
+		t.Errorf("ActiveEncodings = %+v", reqs)
+	}
+	e.do("POST", "/Sessions/Playing/Stopped", e.token, map[string]any{"ItemId": item, "MediaSourceId": v4k["Id"], "PlaySessionId": psid, "PositionTicks": 5})
+	if reqs := e.a.find("/Sessions/Playing/Stopped"); len(reqs) != 1 || !strings.Contains(reqs[0].body, shared["a"]) ||
+		!strings.Contains(reqs[0].body, a4k) || !strings.Contains(reqs[0].body, hexID("9a")) {
+		t.Errorf("Stopped = %+v", reqs)
+	}
+
+	// Asking for one version keeps its ID and asks only its sources.
+	r = e.do("POST", "/Items/"+item+"/PlaybackInfo", e.token, map[string]any{"MediaSourceId": v1080["Id"]})
+	one := r.json(t)["MediaSources"].([]any)
+	if len(one) != 1 || one[0].(map[string]any)["Id"] != v1080["Id"] {
+		t.Errorf("narrowed = %s", r.body)
+	}
+	if reqs := e.b.find("/PlaybackInfo"); len(reqs) != 2 || reqs[1].query.Get("MediaSourceId") != shared["b"] {
+		t.Errorf("b narrowed request = %+v", reqs)
+	}
+
+	// A single-version item keeps its item ID as media source ID.
+	r = e.do("GET", "/Items/"+e.uid("b", bOnly)+"/PlaybackInfo", e.token, nil)
+	if ms := r.json(t)["MediaSources"].([]any); len(ms) != 1 || ms[0].(map[string]any)["Id"] != e.uid("b", bOnly) ||
+		ms[0].(map[string]any)["Name"] != "upstream file name" {
+		t.Errorf("single version = %s", r.body)
+	}
+
+	// Another client device gets its own upstream device.
+	e.do("POST", "/Items/"+item+"/PlaybackInfo", e.token, nil, "Authorization",
+		`MediaBrowser Client="Other", Device="TV", DeviceId="dev2", Version="1", Token="`+e.token+`"`)
+	reqs = e.a.find("/PlaybackInfo")
+	if last := reqs[len(reqs)-1]; !strings.Contains(last.auth, `DeviceId="`+upstream.DeviceID("a", e.userID, "dev2")+`"`) {
+		t.Errorf("second device auth = %s", last.auth)
+	}
+
+	// Hidden or unknown items have no playback info.
+	if r := e.do("POST", "/Items/"+hexID("dead")+"/PlaybackInfo", e.token, nil); r.code != 404 {
+		t.Errorf("unknown item PlaybackInfo = %d", r.code)
 	}
 }

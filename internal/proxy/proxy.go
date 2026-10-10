@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -32,9 +33,56 @@ type Resolver interface {
 // Caller is the authenticated client a request is made for. Zero for
 // anonymous requests.
 type Caller struct {
-	UserID string // JellyBloom user ID
-	Token  string // JellyBloom token the client used
-	Client string // client app name, for logging
+	UserID   string // JellyBloom user ID
+	Token    string // JellyBloom token the client used
+	Client   string // client app name
+	Device   string // client device name
+	DeviceID string // client device ID
+	Version  string // client app version
+}
+
+// device is the upstream device a caller acts as. Anonymous callers use
+// JellyBloom's own session.
+func (c Caller) device(up string) (upstream.Device, bool) {
+	if c.UserID == "" {
+		return upstream.Device{}, false
+	}
+	return upstream.Device{ID: upstream.DeviceID(up, c.UserID, c.DeviceID), Name: c.Device, Client: c.Client, Version: c.Version}, true
+}
+
+// auth is how one request authenticates to an upstream.
+type auth struct {
+	token  string
+	header func(token string) string
+	reauth func(ctx context.Context, stale string) error
+	token2 func(ctx context.Context) (string, error) // current token after reauth
+	device string                                    // upstream device ID ("" for JellyBloom's own)
+}
+
+func (p *Proxy) authFor(ctx context.Context, up *upstream.Client, c Caller) (*auth, error) {
+	if d, ok := c.device(up.Name()); ok {
+		tok, err := up.DeviceToken(ctx, d)
+		if err != nil {
+			return nil, err
+		}
+		return &auth{
+			token:  tok,
+			header: func(t string) string { return up.DeviceAuthHeader(d, t) },
+			reauth: func(ctx context.Context, stale string) error { return up.ReauthDevice(ctx, d, stale) },
+			token2: func(ctx context.Context) (string, error) { return up.DeviceToken(ctx, d) },
+			device: d.ID,
+		}, nil
+	}
+	tok, _, err := up.Session(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &auth{
+		token:  tok,
+		header: up.AuthHeader,
+		reauth: up.Reauth,
+		token2: func(ctx context.Context) (string, error) { t, _, err := up.Session(ctx); return t, err },
+	}, nil
 }
 
 const (
@@ -215,6 +263,9 @@ func (p *Proxy) Fallback(w http.ResponseWriter, r *http.Request, c Caller) {
 		real, ok := toUpstream[n]
 		return real, ok
 	}}
+	if d, ok := c.device(up.Name()); ok && c.DeviceID != "" {
+		req.Literals = []string{c.DeviceID, d.ID} // e.g. DeviceId= on stream URLs
+	}
 	path := req.String(r.URL.Path)
 	query := req.String(stripTokens(r.URL.Query()).Encode())
 	if body != nil {
@@ -275,8 +326,27 @@ func (p *Proxy) route(ctx context.Context, guids []string, c Caller) (*upstream.
 		}
 		allowed = next
 	}
+	// Preference: the rank order of the first multi-copy alias (a playback
+	// version lists its sources best first), then config order.
+	pref := p.ups
+	for _, u := range refs {
+		if u.Lazy && len(u.Refs) > 1 {
+			pref = nil
+			for _, rf := range u.Refs {
+				if up := p.byName[rf.Upstream]; up != nil && !slices.Contains(pref, up) {
+					pref = append(pref, up)
+				}
+			}
+			for _, up := range p.ups {
+				if !slices.Contains(pref, up) {
+					pref = append(pref, up)
+				}
+			}
+			break
+		}
+	}
 	chosen := first
-	for _, up := range p.ups {
+	for _, up := range pref {
 		if allowed[up.Name()] {
 			chosen = up
 			break
@@ -367,50 +437,11 @@ func externalBase(r *http.Request) string {
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, up *upstream.Client, path, query string, body []byte, rewriteResp bool, c Caller) {
 	ctx := r.Context()
-	token, upUser, err := up.Session(ctx)
-	if err != nil {
-		p.log.Error("upstream login failed", "upstream", up.Name(), "err", err)
-		http.Error(w, "upstream unavailable", http.StatusBadGateway)
-		return
+	var stream io.Reader
+	if body == nil && r.Body != nil && r.ContentLength != 0 {
+		stream = r.Body // only when not buffered for rewriting
 	}
-	target := up.BaseURL()
-	target.Path += path
-	target.RawPath = ""
-	target.RawQuery = query
-
-	send := func(token string) (*http.Response, error) {
-		var rb io.Reader
-		switch {
-		case body != nil:
-			rb = bytes.NewReader(body)
-		case r.Body != nil && r.ContentLength != 0:
-			rb = r.Body // streamed (only when not buffered for rewriting)
-		}
-		req, err := http.NewRequestWithContext(ctx, r.Method, target.String(), rb)
-		if err != nil {
-			return nil, err
-		}
-		copyHeaders(req.Header, r.Header, hopHeaders, clientOnlyHeaders)
-		req.Header.Set("Authorization", up.AuthHeader(token))
-		if body != nil {
-			req.ContentLength = int64(len(body))
-		} else if rb != nil {
-			req.ContentLength = r.ContentLength
-		}
-		return p.hc.Do(req)
-	}
-
-	resp, err := send(token)
-	replayable := body != nil || r.Body == nil || r.ContentLength == 0
-	if err == nil && resp.StatusCode == http.StatusUnauthorized && replayable {
-		resp.Body.Close()
-		if err = up.Reauth(ctx, token); err == nil {
-			token, upUser, err = up.Session(ctx)
-			if err == nil {
-				resp, err = send(token)
-			}
-		}
-	}
+	resp, a, err := p.send(ctx, up, c, r.Method, path, query, r.Header, body, stream, r.ContentLength)
 	if err != nil {
 		if ctx.Err() == nil {
 			p.log.Warn("upstream request failed", "upstream", up.Name(), "path", rewrite.Template(path), "err", err)
@@ -419,6 +450,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, up *upstream.Cli
 		return
 	}
 	defer resp.Body.Close()
+	_, upUser, _ := up.Session(ctx)
+	token := a.token
 
 	// Even unmodified responses must not leak the upstream's address in redirects.
 	rep := &rewrite.Replacer{Literals: []string{up.BaseURL().String(), externalBase(r)}}
@@ -461,8 +494,101 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, up *upstream.Cli
 	w.Write(out)
 }
 
+// send makes one upstream request for c, retrying once with a fresh login if
+// the upstream rejects the token and the body can be replayed.
+func (p *Proxy) send(ctx context.Context, up *upstream.Client, c Caller, method, path, query string, hdr http.Header,
+	body []byte, stream io.Reader, length int64) (*http.Response, *auth, error) {
+	a, err := p.authFor(ctx, up, c)
+	if err != nil {
+		return nil, nil, err
+	}
+	target := up.BaseURL()
+	target.Path += path
+	target.RawPath = ""
+	target.RawQuery = query
+
+	do := func(token string) (*http.Response, error) {
+		var rb io.Reader = stream
+		if body != nil {
+			rb = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, target.String(), rb)
+		if err != nil {
+			return nil, err
+		}
+		if hdr != nil {
+			copyHeaders(req.Header, hdr, hopHeaders, clientOnlyHeaders)
+		}
+		req.Header.Set("Authorization", a.header(token))
+		switch {
+		case body != nil:
+			req.ContentLength = int64(len(body))
+		case stream != nil:
+			req.ContentLength = length
+		}
+		return p.hc.Do(req)
+	}
+
+	resp, err := do(a.token)
+	if err == nil && resp.StatusCode == http.StatusUnauthorized && stream == nil {
+		resp.Body.Close()
+		if err = a.reauth(ctx, a.token); err == nil {
+			if a.token, err = a.token2(ctx); err == nil {
+				resp, err = do(a.token)
+			}
+		}
+	}
+	return resp, a, err
+}
+
+// Call sends one request to the named upstream on behalf of c (as c's
+// upstream device) and returns the response with a replacer that maps the
+// upstream's IDs, URLs, tokens, and device ID to JellyBloom's for r's client.
+// The caller must close the response body.
+func (p *Proxy) Call(ctx context.Context, r *http.Request, upName string, c Caller, method, path string,
+	query url.Values, body []byte) (*http.Response, *rewrite.Replacer, error) {
+	up := p.byName[upName]
+	if up == nil {
+		return nil, nil, fmt.Errorf("proxy: unknown upstream %q", upName)
+	}
+	hdr := http.Header{"Accept": {"application/json"}}
+	if body != nil {
+		hdr.Set("Content-Type", "application/json")
+	}
+	resp, a, err := p.send(ctx, up, c, method, path, stripTokens(query).Encode(), hdr, body, nil, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	_, upUser, _ := up.Session(ctx)
+	// The replacer outlives ctx (which may be a short fan-out deadline), so
+	// it resolves IDs under the client request's context.
+	return resp, p.responseReplacer(r.Context(), r, up, a.token, upUser, c), nil
+}
+
+// UpstreamUser returns JellyBloom's user ID on an upstream.
+func (p *Proxy) UpstreamUser(ctx context.Context, upName string) string {
+	if up := p.byName[upName]; up != nil {
+		_, u, _ := up.Session(ctx)
+		return identity.NormalizeID(u)
+	}
+	return ""
+}
+
+// Upstreams returns upstream names in config order.
+func (p *Proxy) Upstreams() []string {
+	var out []string
+	for _, u := range p.ups {
+		out = append(out, u.Name())
+	}
+	return out
+}
+
 // responseReplacer maps upstream IDs, URLs, and tokens to JellyBloom's.
 func (p *Proxy) responseReplacer(ctx context.Context, r *http.Request, up *upstream.Client, token, upUser string, c Caller) *rewrite.Replacer {
+	var upDevice string
+	if d, ok := c.device(up.Name()); ok {
+		upDevice = d.ID
+	}
 	upUser = identity.NormalizeID(upUser)
 	upServer := p.upstreamServerID(ctx, up)
 	upToken := identity.NormalizeID(token)
@@ -471,8 +597,8 @@ func (p *Proxy) responseReplacer(ctx context.Context, r *http.Request, up *upstr
 	return &rewrite.Replacer{
 		GUID: func(n string) (string, bool) {
 			switch {
-			case n == upToken:
-				return "", false // replaced by the literal below
+			case n == upToken, n == upDevice && upDevice != "":
+				return "", false // replaced by the literals below
 			case n == upUser && c.UserID != "":
 				return c.UserID, true
 			case n == upServer:
@@ -489,7 +615,7 @@ func (p *Proxy) responseReplacer(ctx context.Context, r *http.Request, up *upstr
 			memo[n] = id
 			return id, true
 		},
-		Literals: []string{base, externalBase(r), token, c.Token},
+		Literals: []string{base, externalBase(r), token, c.Token, upDevice, c.DeviceID},
 	}
 }
 

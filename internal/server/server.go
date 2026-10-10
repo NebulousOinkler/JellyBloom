@@ -21,6 +21,7 @@ import (
 
 	"github.com/NebulousOinkler/JellyBloom/internal/auth"
 	"github.com/NebulousOinkler/JellyBloom/internal/catalog"
+	"github.com/NebulousOinkler/JellyBloom/internal/playback"
 	"github.com/NebulousOinkler/JellyBloom/internal/proxy"
 )
 
@@ -48,6 +49,7 @@ type Options struct {
 	Auth       *auth.Service
 	Proxy      *proxy.Proxy
 	Catalog    *catalog.Catalog
+	Playback   *playback.Handler
 	// Version reports the web upstream's Jellyfin version. JellyBloom claims
 	// the same version so the jellyfin-web it serves sees a matching server.
 	Version func(ctx context.Context) (string, error)
@@ -152,6 +154,12 @@ func (s *Server) routes() {
 	}))
 
 	s.browseRoutes(rt)
+
+	playbackInfo := s.authed(func(w http.ResponseWriter, r *http.Request, c *caller) {
+		s.opts.Playback.PlaybackInfo(w, r, proxyCaller(c))
+	})
+	rt.handle(http.MethodGet, "/Items/{id}/PlaybackInfo", playbackInfo)
+	rt.handle(http.MethodPost, "/Items/{id}/PlaybackInfo", playbackInfo)
 }
 
 // caller is an authenticated request's session.
@@ -204,7 +212,21 @@ func (s *Server) fallback(w http.ResponseWriter, r *http.Request) {
 }
 
 func proxyCaller(c *caller) proxy.Caller {
-	return proxy.Caller{UserID: c.user.ID, Token: c.sess.Token, Client: c.sess.Client}
+	pc := proxy.Caller{UserID: c.user.ID, Token: c.sess.Token, Client: c.sess.Client, Device: c.sess.DeviceName,
+		DeviceID: c.sess.DeviceID, Version: c.sess.Version}
+	// What the request itself says wins: it reflects the client making this
+	// call. Stream URLs often carry only a DeviceId query parameter.
+	for _, f := range []struct {
+		dst *string
+		v   string
+	}{
+		{&pc.DeviceID, c.info.DeviceID}, {&pc.Device, c.info.Device}, {&pc.Client, c.info.Client}, {&pc.Version, c.info.Version},
+	} {
+		if f.v != "" {
+			*f.dst = f.v
+		}
+	}
+	return pc
 }
 
 func (s *Server) internal(w http.ResponseWriter, err error) {

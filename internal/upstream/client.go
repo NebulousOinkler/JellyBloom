@@ -51,6 +51,9 @@ type Client struct {
 	mu      sync.RWMutex
 	token   string
 	userID  string
+
+	devMu   sync.Mutex
+	devices map[string]*deviceSession // per-client sessions, by Device.ID
 }
 
 // StatusError is a non-2xx response from an upstream.
@@ -238,6 +241,11 @@ func (c *Client) authed(ctx context.Context, method, path string, query url.Valu
 
 // send performs one logical request with retries for transient failures.
 func (c *Client) send(ctx context.Context, method, path string, query url.Values, body any, token string, out any) error {
+	return c.sendAuth(ctx, method, path, query, body, c.authHeader(token), out)
+}
+
+// sendAuth is send with an explicit Authorization header.
+func (c *Client) sendAuth(ctx context.Context, method, path string, query url.Values, body any, auth string, out any) error {
 	var payload []byte
 	if body != nil {
 		var err error
@@ -252,7 +260,7 @@ func (c *Client) send(ctx context.Context, method, path string, query url.Values
 		if err != nil {
 			return err
 		}
-		req.Header.Set("Authorization", c.authHeader(token))
+		req.Header.Set("Authorization", auth)
 		req.Header.Set("Accept", "application/json")
 		if body != nil {
 			req.Header.Set("Content-Type", "application/json")

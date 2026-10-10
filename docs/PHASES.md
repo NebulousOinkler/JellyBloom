@@ -85,12 +85,25 @@ with the "done when" check from that table. Target upstream version: Jellyfin 10
 - Benchmarks (50k copies): catalog reload ~0.5 s; 100-item page ~15 ms.
 
 ## Phase 6: Playback (`internal/playback`)
-- [ ] `PlaybackInfo`: fan out to every source, group copies into versions, rank, assign unified `MediaSource.Id`s
-- [ ] Active-source table per (user, device, item); `PlaySessionId` → source
-- [ ] Direct-play and direct-stream relay with `Range` (bounded buffer, no disk)
-- [ ] HLS master and media playlist rewriting; segment routing
-- [ ] Subtitle relay
-- [ ] Forward progress reports; clean up on `Stopped` and `ActiveEncodings`
+- [x] `PlaybackInfo`: fan out to every source, group copies into versions, rank, assign unified `MediaSource.Id`s
+- [x] Active-source table per (user, device, item); `PlaySessionId` → source
+- [x] Direct-play and direct-stream relay with `Range` (bounded buffer, no disk)
+- [x] HLS master and media playlist rewriting; segment routing
+- [x] Subtitle relay
+- [x] Forward progress reports; clean up on `Stopped` and `ActiveEncodings`
+- [x] Per-client upstream devices: each (JellyBloom user, client device) is its own device on
+  every upstream (own login for password upstreams; header DeviceId for API keys), so
+  sessions and transcodes of different clients never collide. Client `DeviceId` query
+  values map to it and back.
+- Routing reuses the generic proxy: version IDs and JellyBloom play-session IDs are aliases
+  over the upstream sources they stand for (best first), so playlists, segments, subtitles,
+  progress reports, and `ActiveEncodings` reach the right upstream with its real IDs.
+- Versions group copies by container, size, runtime, and stream layout; each is labelled by
+  its encode ("4K HEVC HDR"), never by upstream. A single version keeps the item ID.
+- Source order within a version is config order for now; phase 8 ranks by health and
+  throughput and adds failover.
+- Follow-ups for phase 9: prune old play-session aliases; consider hiding upstream file
+  `Path` in media sources.
 
 ## Phase 7: User state (`internal/userdata`)
 - [ ] Played, favorite, resume position, play count; both route styles
