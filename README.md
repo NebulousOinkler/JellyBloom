@@ -48,6 +48,12 @@ In the container, set `data_dir: /data`. The image is static and runs as a non-r
   JellyBloom tries another or gives up; `stall_timeout` (default 10s) is how long a stream
   may stop before failing over.
 
+## The traveling library
+`scripts/travel.sh` sets up JellyBloom on a laptop that carries part of your library:
+local copies play first, home fills the gaps, it works offline, and packing and unpacking
+lists come for free. `jellybloom sync` keeps watch history the same on the laptop and at
+home. See [docs/TRAVELING-LIBRARY.md](docs/TRAVELING-LIBRARY.md).
+
 ## Design
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the architecture, and
 [testrig/README.md](testrig/README.md) for the test rig.

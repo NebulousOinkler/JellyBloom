@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -450,3 +452,50 @@ func TestPruneSessionAliases(t *testing.T) {
 		}
 	}
 }
+
+func TestKeysOfAndResolve(t *testing.T) {
+	ctx := context.Background()
+	movie := func(id, tmdb string) json.RawMessage {
+		return json.RawMessage(`{"Id":"` + id + `","Type":"Movie","Name":"Film","ProductionYear":2001,"ProviderIds":{"Tmdb":"` + tmdb + `"}}`)
+	}
+	open := func(up, id string) *Resolver {
+		idx, err := index.Open(filepath.Join(t.TempDir(), "db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { idx.Close() })
+		fs, _ := idx.BeginFullSync(ctx, up)
+		fs.PutViews(ctx, []json.RawMessage{json.RawMessage(`{"Id":"` + hexID("f1") + `","Name":"Movies","CollectionType":"movies"}`)})
+		fs.PutItems(ctx, hexID("f1"), []json.RawMessage{movie(id, "603")})
+		fs.Commit(ctx)
+		r, err := New(idx, Mode{Op: Union, Upstreams: []string{up}}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.Rebuild(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	a, b := open("home", hexID("a1")), open("laptop", hexID("b1"))
+	ua, _ := a.UnifiedID(ctx, "home", hexID("a1"))
+	keys, err := a.KeysOf(ctx, []string{ua})
+	if err != nil || !slices.Contains(keys[ua], "movie:tmdb:603") {
+		t.Fatalf("keys = %v %v", keys, err)
+	}
+	ub, _ := b.UnifiedID(ctx, "laptop", hexID("b1"))
+	// Same match keys: the same ID on both instances anyway.
+	if got := b.Resolve(ctx, ua, keys[ua]); got != ub {
+		t.Errorf("Resolve = %s, want b's %s", got, ub)
+	}
+	// An ID b does not know, found by key.
+	if got := b.Resolve(ctx, hexID("99"), keys[ua]); got != ub {
+		t.Errorf("Resolve by key = %s, want %s", got, ub)
+	}
+	// Unknown everywhere: kept as is.
+	if got := b.Resolve(ctx, hexID("98"), []string{"movie:tmdb:1"}); got != hexID("98") {
+		t.Errorf("unknown = %s", got)
+	}
+}
+
+func hexID(prefix string) string { return prefix + strings.Repeat("0", 32-len(prefix)) }

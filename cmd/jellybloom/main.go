@@ -47,6 +47,7 @@ func main() {
 		"pair":          pairCmd,
 		"unpair":        unpairCmd,
 		"report":        reportCmd,
+		"sync":          syncCmd,
 	}
 	if len(os.Args) > 1 {
 		if cmd, ok := subcommands[os.Args[1]]; ok {

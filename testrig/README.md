@@ -24,6 +24,7 @@ testrig/smoke.py               # drive JellyBloom like a client; PASS/FAIL per c
 testrig/compare.py             # same user-state steps on real Jellyfin and JellyBloom; diff
 testrig/failover.py            # copy checks, ranking, and failover under injected faults
 testrig/setops.py              # intersection, a \ b, b \ a instances checked against the servers
+testrig/travel.py              # the traveling library (scripts/travel.sh), end to end
 testrig/servers.sh stop-server b   # simulate an upstream outage (start-server b to recover)
 testrig/servers.sh faults a '{"cut_after": 30000000}'   # inject faults on a (clear: faults a clear)
 testrig/servers.sh stop

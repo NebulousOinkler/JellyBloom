@@ -920,3 +920,55 @@ func (r *Resolver) EachFile(ctx context.Context, fn func(id, typ string, copies 
 	}
 	return flush()
 }
+
+// KeysOf returns the match keys of unified item IDs (for moving user state
+// to another JellyBloom, which may know an item under another ID).
+func (r *Resolver) KeysOf(ctx context.Context, ids []string) (map[string][]string, error) {
+	out := map[string][]string{}
+	for start := 0; start < len(ids); start += 400 {
+		chunk := ids[start:min(start+400, len(ids))]
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = NormalizeID(id)
+		}
+		rows, err := r.db.QueryContext(ctx, `SELECT unified_id, key FROM identity_keys WHERE unified_id IN (?`+
+			strings.Repeat(", ?", len(chunk)-1)+`) ORDER BY unified_id, key`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id, key string
+			if err := rows.Scan(&id, &key); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[id] = append(out[id], key)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// Resolve maps an item ID from another JellyBloom to this one's ID for the
+// same item: the ID itself if this instance knows it (following merges),
+// else the item one of its match keys belongs to, else the ID unchanged (the
+// item may appear here later under it, since IDs derive from match keys).
+func (r *Resolver) Resolve(ctx context.Context, id string, keys []string) string {
+	id = NormalizeID(id)
+	if u, err := r.Lookup(ctx, id); err == nil && !u.Lazy {
+		return u.ID
+	}
+	for _, k := range keys {
+		var uid string
+		if r.db.QueryRowContext(ctx, `SELECT unified_id FROM identity_keys WHERE key = ?`, k).Scan(&uid) == nil {
+			if u, err := r.Lookup(ctx, uid); err == nil && !u.Lazy {
+				return u.ID
+			}
+			return uid
+		}
+	}
+	return id
+}

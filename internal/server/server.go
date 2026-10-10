@@ -57,9 +57,12 @@ type Options struct {
 	// Sources relays files with failover and builds the redundancy report;
 	// nil leaves file streams to the generic proxy.
 	Sources *sources.Registry
-	// Resolver maps version IDs from PlaybackInfo to their copies.
+	// Resolver maps version IDs from PlaybackInfo to their copies, and item
+	// IDs to and from match keys for syncing user state between instances.
 	Resolver interface {
 		Lookup(ctx context.Context, id string) (*identity.Unified, error)
+		KeysOf(ctx context.Context, ids []string) (map[string][]string, error)
+		Resolve(ctx context.Context, id string, keys []string) string
 	}
 	// Version reports the web upstream's Jellyfin version. JellyBloom claims
 	// the same version so the jellyfin-web it serves sees a matching server.
@@ -176,6 +179,7 @@ func (s *Server) routes() {
 	s.listRoutes(rt)
 	s.browseRoutes(rt)
 	s.streamRoutes(rt)
+	s.syncRoutes(rt)
 
 	playbackInfo := s.authed(func(w http.ResponseWriter, r *http.Request, c *caller) {
 		s.opts.Playback.PlaybackInfo(w, r, proxyCaller(c))

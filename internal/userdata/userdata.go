@@ -58,11 +58,21 @@ CREATE TABLE IF NOT EXISTS collection_items (
 	hidden        INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (collection_id, item_id)
 );
+-- Deleted playlists, so a sync with another JellyBloom deletes them there
+-- too instead of bringing them back.
+CREATE TABLE IF NOT EXISTS playlist_deletions (
+	id      TEXT PRIMARY KEY,
+	owner   TEXT NOT NULL,
+	deleted INTEGER NOT NULL -- unix ms
+);
 `
 
 // migrations bring tables created by earlier versions up to date.
 var migrations = []struct{ table, column, ddl string }{
 	{"collection_items", "hidden", `ALTER TABLE collection_items ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0`},
+	// When a record or playlist last changed (unix ms), for sync.
+	{"user_data", "updated", `ALTER TABLE user_data ADD COLUMN updated INTEGER NOT NULL DEFAULT 0`},
+	{"playlists", "updated", `ALTER TABLE playlists ADD COLUMN updated INTEGER NOT NULL DEFAULT 0`},
 }
 
 // Record is one user's state for one item.
@@ -217,11 +227,12 @@ func (s *Store) Update(ctx context.Context, userID string, ids []string, fn func
 		if !r.LastPlayed.IsZero() {
 			last = r.LastPlayed.UnixMilli()
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO user_data (user_id, `+recordCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		_, err = tx.ExecContext(ctx, `INSERT INTO user_data (user_id, `+recordCols+`, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (user_id, item_id) DO UPDATE SET played = excluded.played, play_count = excluded.play_count,
 				is_favorite = excluded.is_favorite, likes = excluded.likes, position = excluded.position,
-				last_played = excluded.last_played, audio_stream = excluded.audio_stream, sub_stream = excluded.sub_stream`,
-			userID, id, r.Played, r.PlayCount, r.IsFavorite, likes, r.Position, last, audio, sub)
+				last_played = excluded.last_played, audio_stream = excluded.audio_stream, sub_stream = excluded.sub_stream,
+				updated = excluded.updated`,
+			userID, id, r.Played, r.PlayCount, r.IsFavorite, likes, r.Position, last, audio, sub, s.now().UnixMilli())
 		if err != nil {
 			return nil, err
 		}
@@ -245,7 +256,7 @@ func (s *Store) FollowRedirects(ctx context.Context) error {
 			played = MAX(n.played, o.played), play_count = n.play_count + o.play_count,
 			is_favorite = MAX(n.is_favorite, o.is_favorite), likes = COALESCE(n.likes, o.likes),
 			position = CASE WHEN o.last_played > n.last_played THEN o.position ELSE n.position END,
-			last_played = MAX(n.last_played, o.last_played)
+			last_played = MAX(n.last_played, o.last_played), updated = MAX(n.updated, o.updated)
 		FROM identity_redirects r JOIN user_data o ON o.item_id = r.old_id
 		WHERE n.item_id = r.new_id AND n.user_id = o.user_id`,
 		`DELETE FROM user_data WHERE item_id IN (SELECT old_id FROM identity_redirects)

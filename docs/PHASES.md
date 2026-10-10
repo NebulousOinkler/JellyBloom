@@ -268,3 +268,12 @@ paths for clients.
 - Superseded: the docker-compose test rig (the native rig plus podman covers it)
 - Later: hot reload or an admin API for upstreams; per-person pairing; importing upstream
   watch history; playlist sharing
+
+## After phase 9: the traveling library
+- [x] `scripts/travel.sh`: library (union, laptop first, laptop serves the web app),
+  packing list (home \ laptop), unpacking list (laptop \ home); `init`, `start`, `stop`,
+  `status`, `sync`, `report`
+- [x] User state sync between instances: change times on records and playlists, playlist
+  deletion records, export and merge (most recent change wins), items matched by match keys;
+  admin endpoints and `jellybloom sync`
+- [x] `testrig/travel.py` (19 checks) runs the whole scenario on the rig

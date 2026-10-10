@@ -57,7 +57,8 @@ func (s *Store) CreatePlaylist(ctx context.Context, owner, name, mediaType strin
 		return nil, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO playlists VALUES (?, ?, ?, ?, ?)`, p.ID, owner, name, mediaType, p.Created.UnixMilli()); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO playlists (id, owner, name, media_type, created, updated) VALUES (?, ?, ?, ?, ?, ?)`,
+		p.ID, owner, name, mediaType, p.Created.UnixMilli(), p.Created.UnixMilli()); err != nil {
 		return nil, err
 	}
 	if err := insertEntries(ctx, tx, p.ID, 0, items); err != nil {
@@ -149,7 +150,7 @@ func (s *Store) editPlaylist(ctx context.Context, owner, id string, fn func([]En
 	defer tx.Rollback()
 	// Writing first takes the write lock now, so concurrent edits queue
 	// instead of failing or overwriting each other; it also checks the owner.
-	res, err := tx.ExecContext(ctx, `UPDATE playlists SET name = name WHERE id = ? AND owner = ?`, id, owner)
+	res, err := tx.ExecContext(ctx, `UPDATE playlists SET updated = ? WHERE id = ? AND owner = ?`, s.now().UnixMilli(), id, owner)
 	if err != nil {
 		return err
 	}
@@ -215,7 +216,7 @@ func (s *Store) UpdatePlaylist(ctx context.Context, owner, id, name string, item
 		return err
 	}
 	if name != "" {
-		if _, err := s.db.ExecContext(ctx, `UPDATE playlists SET name = ? WHERE id = ?`, name, id); err != nil {
+		if _, err := s.db.ExecContext(ctx, `UPDATE playlists SET name = ?, updated = ? WHERE id = ?`, name, s.now().UnixMilli(), id); err != nil {
 			return err
 		}
 	}
@@ -231,15 +232,30 @@ func (s *Store) UpdatePlaylist(ctx context.Context, owner, id, name string, item
 	})
 }
 
-// DeletePlaylist removes owner's playlist.
+// DeletePlaylist removes owner's playlist, remembering the deletion for sync.
 func (s *Store) DeletePlaylist(ctx context.Context, owner, id string) error {
 	if _, err := s.Playlist(ctx, owner, id); err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM playlist_entries WHERE playlist_id = ?`, id); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM playlists WHERE id = ?`, id)
+	defer tx.Rollback()
+	if err := deletePlaylist(ctx, tx, id, owner, s.now().UnixMilli()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func deletePlaylist(ctx context.Context, tx *sql.Tx, id, owner string, at int64) error {
+	for _, q := range []string{`DELETE FROM playlist_entries WHERE playlist_id = ?`, `DELETE FROM playlists WHERE id = ?`} {
+		if _, err := tx.ExecContext(ctx, q, id); err != nil {
+			return err
+		}
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO playlist_deletions (id, owner, deleted) VALUES (?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET deleted = MAX(deleted, excluded.deleted)`, id, owner, at)
 	return err
 }
 

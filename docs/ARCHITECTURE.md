@@ -347,6 +347,15 @@ whichever upstream serves an item:
   the upstream's members and never sent upstream
 - when items merge (identity redirect), their user data and list entries move to the new ID
 
+### Syncing user state between instances
+Two JellyBloom instances (one at home, one on a laptop that travels) can share user state.
+`GET /JellyBloom/UserData` exports every user's item state and playlists, and playlist
+deletions; `POST /JellyBloom/UserData` merges another instance's export (admin users
+only). `jellybloom sync` does both directions. Every record and playlist carries the time
+it last changed, and the most recent change wins, with a deterministic tie-break, so both
+sides end equal. Users match by name (their IDs derive from it); items match by ID, else
+by their match keys, so an instance that knows a title under another ID still finds it.
+
 ## Upstream credentials
 
 JellyBloom needs upstream *tokens*, never passwords. Jellyfin tokens do not expire, can
