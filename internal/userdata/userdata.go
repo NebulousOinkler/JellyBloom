@@ -48,13 +48,22 @@ CREATE TABLE IF NOT EXISTS collections (
 	name    TEXT NOT NULL,
 	created INTEGER NOT NULL
 );
+-- Items of JellyBloom's collections, and edits to upstream collections
+-- (keyed by the upstream collection's unified ID): hidden = 1 removes an
+-- upstream member.
 CREATE TABLE IF NOT EXISTS collection_items (
 	collection_id TEXT NOT NULL,
 	item_id       TEXT NOT NULL,
 	added         INTEGER NOT NULL,
+	hidden        INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (collection_id, item_id)
 );
 `
+
+// migrations bring tables created by earlier versions up to date.
+var migrations = []struct{ table, column, ddl string }{
+	{"collection_items", "hidden", `ALTER TABLE collection_items ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0`},
+}
 
 // Record is one user's state for one item.
 type Record struct {
@@ -69,8 +78,9 @@ type Record struct {
 	SubtitleStream *int
 }
 
-// Resumable reports whether playback can resume part-way.
-func (r Record) Resumable() bool { return r.Position > 0 && !r.Played }
+// Resumable reports whether playback can resume part-way. As in Jellyfin,
+// a played item being watched again is resumable too.
+func (r Record) Resumable() bool { return r.Position > 0 }
 
 // Store persists user data, playlists, and collections. Safe for concurrent use.
 type Store struct {
@@ -82,6 +92,17 @@ type Store struct {
 func Open(db *sql.DB) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
+	}
+	for _, m := range migrations {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, m.table, m.column).Scan(&n); err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			if _, err := db.Exec(m.ddl); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return &Store{db: db, now: time.Now}, nil
 }
@@ -164,6 +185,14 @@ func (s *Store) Update(ctx context.Context, userID string, ids []string, fn func
 		return nil, err
 	}
 	defer tx.Rollback()
+	// Writing first takes the write lock now (waiting out other writers), so
+	// the reads below see the latest state and concurrent edits neither fail
+	// nor overwrite each other. An empty row reads like a missing one.
+	if len(ids) > 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO user_data (user_id, item_id) VALUES (?, ?)`, userID, ids[0]); err != nil {
+			return nil, err
+		}
+	}
 	out := map[string]Record{}
 	for _, id := range ids {
 		r, err := scanRecord(tx.QueryRowContext(ctx, `SELECT `+recordCols+` FROM user_data WHERE user_id = ? AND item_id = ?`, userID, id))
@@ -230,6 +259,10 @@ func (s *Store) FollowRedirects(ctx context.Context) error {
 		`UPDATE OR IGNORE collection_items SET item_id = (SELECT new_id FROM identity_redirects WHERE old_id = item_id)
 			WHERE item_id IN (SELECT old_id FROM identity_redirects)`,
 		`DELETE FROM collection_items WHERE item_id IN (SELECT old_id FROM identity_redirects)`,
+		// Edits to an upstream collection follow it too.
+		`UPDATE OR IGNORE collection_items SET collection_id = (SELECT new_id FROM identity_redirects WHERE old_id = collection_id)
+			WHERE collection_id IN (SELECT old_id FROM identity_redirects)`,
+		`DELETE FROM collection_items WHERE collection_id IN (SELECT old_id FROM identity_redirects)`,
 	} {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return err

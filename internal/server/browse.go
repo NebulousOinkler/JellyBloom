@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/NebulousOinkler/JellyBloom/internal/catalog"
 	"github.com/NebulousOinkler/JellyBloom/internal/identity"
@@ -69,6 +70,21 @@ func (p params) int(k string, def int) int {
 func (p params) intPtr(k string) *int {
 	if n, err := strconv.Atoi(p.str(k)); err == nil {
 		return &n
+	}
+	return nil
+}
+
+// time parses an ISO 8601 date (Jellyfin clients send RFC 3339, sometimes
+// with 7 fractional digits or no zone); nil if absent or invalid.
+func (p params) time(k string) *time.Time {
+	v := p.str(k)
+	if v == "" {
+		return nil
+	}
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05.9999999", "2006-01-02"} {
+		if t, err := time.Parse(layout, v); err == nil {
+			return &t
+		}
 	}
 	return nil
 }
@@ -193,11 +209,16 @@ func (s *Server) browseRoutes(rt *router) {
 		if identity.NormalizeID(parent) == rootFolderID {
 			parent = ""
 		}
-		res, err := s.catalog.NextUp(r.Context(), catalog.NextUpOptions{
+		n := catalog.NextUpOptions{
 			SeriesID: p.str("seriesId"), ParentID: parent, StartIndex: p.int("startIndex", 0), Limit: p.int("limit", 0),
-			SkipResumable:       strings.EqualFold(p.str("enableResumable"), "false"),
-			DisableFirstEpisode: strings.EqualFold(p.str("disableFirstEpisode"), "true"),
-		}, p.listOptions(c))
+			SkipResumable: strings.EqualFold(p.str("enableResumable"), "false"),
+			Rewatching:    strings.EqualFold(p.str("enableRewatching"), "true"),
+		}
+		if t := p.time("nextUpDateCutoff"); t != nil {
+			n.Cutoff = *t
+		}
+		// disableFirstEpisode is accepted and ignored, as Jellyfin 12.2 does.
+		res, err := s.catalog.NextUp(r.Context(), n, p.listOptions(c))
 		s.writeResult(w, res, err)
 	}))
 	rt.handle(http.MethodGet, "/Shows/Upcoming", s.authed(func(w http.ResponseWriter, r *http.Request, c *caller) {

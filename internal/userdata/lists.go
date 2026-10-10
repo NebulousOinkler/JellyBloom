@@ -1,6 +1,7 @@
 package userdata
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -90,19 +91,29 @@ func (s *Store) Playlist(ctx context.Context, owner, id string) (*Playlist, erro
 		return nil, err
 	}
 	p.Created = time.UnixMilli(created)
-	rows, err := s.db.QueryContext(ctx, `SELECT entry_id, item_id FROM playlist_entries WHERE playlist_id = ? ORDER BY position`, id)
+	p.Entries, err = playlistEntries(ctx, s.db, id)
+	return p, err
+}
+
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func playlistEntries(ctx context.Context, q querier, id string) ([]Entry, error) {
+	rows, err := q.QueryContext(ctx, `SELECT entry_id, item_id FROM playlist_entries WHERE playlist_id = ? ORDER BY position`, id)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	var out []Entry
 	for rows.Next() {
 		var e Entry
 		if err := rows.Scan(&e.ID, &e.ItemID); err != nil {
 			return nil, err
 		}
-		p.Entries = append(p.Entries, e)
+		out = append(out, e)
 	}
-	return p, rows.Err()
+	return out, rows.Err()
 }
 
 // Playlists lists owner's playlists (entries included), by name.
@@ -131,19 +142,28 @@ func (s *Store) Playlists(ctx context.Context, owner string) ([]*Playlist, error
 
 // editPlaylist rewrites owner's playlist entries with fn.
 func (s *Store) editPlaylist(ctx context.Context, owner, id string, fn func([]Entry) ([]Entry, error)) error {
-	p, err := s.Playlist(ctx, owner, id)
-	if err != nil {
-		return err
-	}
-	entries, err := fn(slices.Clone(p.Entries))
-	if err != nil {
-		return err
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	// Writing first takes the write lock now, so concurrent edits queue
+	// instead of failing or overwriting each other; it also checks the owner.
+	res, err := tx.ExecContext(ctx, `UPDATE playlists SET name = name WHERE id = ? AND owner = ?`, id, owner)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return cmp.Or(err, ErrNotFound)
+	}
+	current, err := playlistEntries(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	entries, err := fn(current)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM playlist_entries WHERE playlist_id = ?`, id); err != nil {
 		return err
 	}
@@ -247,7 +267,7 @@ func (s *Store) Collection(ctx context.Context, id string) (*Collection, error) 
 		return nil, err
 	}
 	c.Created = time.UnixMilli(created)
-	rows, err := s.db.QueryContext(ctx, `SELECT item_id FROM collection_items WHERE collection_id = ? ORDER BY added, item_id`, id)
+	rows, err := s.db.QueryContext(ctx, `SELECT item_id FROM collection_items WHERE collection_id = ? AND hidden = 0 ORDER BY added, item_id`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -284,15 +304,54 @@ func (s *Store) Collections(ctx context.Context) ([]*Collection, error) {
 	return out, nil
 }
 
-// AddToCollection adds items (duplicates are ignored).
+// AddToCollection adds items (duplicates are ignored). For an upstream
+// collection, id is its unified ID and the items are added on top of its
+// upstream members.
 func (s *Store) AddToCollection(ctx context.Context, id string, items []string) error {
 	now := s.now().UnixMilli()
 	for i, it := range items {
-		if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO collection_items VALUES (?, ?, ?)`, id, it, now+int64(i)); err != nil {
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO collection_items (collection_id, item_id, added) VALUES (?, ?, ?)
+			ON CONFLICT (collection_id, item_id) DO UPDATE SET hidden = 0`, id, it, now+int64(i)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// HideInCollection removes items from an upstream collection as JellyBloom
+// shows it (the upstream is not changed).
+func (s *Store) HideInCollection(ctx context.Context, id string, items []string) error {
+	now := s.now().UnixMilli()
+	for _, it := range items {
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO collection_items (collection_id, item_id, added, hidden) VALUES (?, ?, ?, 1)
+			ON CONFLICT (collection_id, item_id) DO UPDATE SET hidden = 1`, id, it, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CollectionEdits returns the items added to and hidden from an upstream
+// collection.
+func (s *Store) CollectionEdits(ctx context.Context, id string) (added, hidden []string, err error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT item_id, hidden FROM collection_items WHERE collection_id = ? ORDER BY added, item_id`, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var it string
+		var h bool
+		if err := rows.Scan(&it, &h); err != nil {
+			return nil, nil, err
+		}
+		if h {
+			hidden = append(hidden, it)
+		} else {
+			added = append(added, it)
+		}
+	}
+	return added, hidden, rows.Err()
 }
 
 // RemoveFromCollection removes items.

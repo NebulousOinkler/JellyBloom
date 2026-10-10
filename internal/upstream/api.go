@@ -115,6 +115,19 @@ func (c *Client) Views(ctx context.Context) (*QueryResult, error) {
 	return &res, nil
 }
 
+// Ancestors returns an item's ancestors, nearest first. Jellyfin reports a
+// library's physical root folders as the library (CollectionFolder) itself.
+func (c *Client) Ancestors(ctx context.Context, id string) ([]json.RawMessage, error) {
+	if err := c.ensureLogin(ctx, ""); err != nil {
+		return nil, err
+	}
+	var res []json.RawMessage
+	if err := c.get(ctx, "/Items/"+url.PathEscape(id)+"/Ancestors", url.Values{"userId": {c.UserID()}}, &res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
 // Items runs one /Items query as the upstream user.
 func (c *Client) Items(ctx context.Context, q ItemsQuery) (*QueryResult, error) {
 	return c.query(ctx, "/Items", q)

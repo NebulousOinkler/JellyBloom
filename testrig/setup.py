@@ -25,13 +25,15 @@ RIG = os.path.join(DATA, "rig.json")
 
 SERVERS = {
     "a": {"url": "http://127.0.0.1:8201", "libraries": [("Movies", "movies", "movies"), ("Shows", "tvshows", "shows")]},
-    "b": {"url": "http://127.0.0.1:8202", "libraries": [("Music", "music", "music"), ("Movies", "movies", "movies")]},
+    "b": {"url": "http://127.0.0.1:8202", "libraries": [("Music", "music", "music"), ("Movies", "movies", "movies"), ("Books", "books", "books")]},
 }
 AUTH = 'MediaBrowser Client="testrig", Device="setup", DeviceId="testrig-setup", Version="1"'
 NO_FETCHERS = [  # keep scans offline: no internet metadata (local image extraction stays on)
     {"Type": t, "MetadataFetchers": [], "MetadataFetcherOrder": []}
-    for t in ["Movie", "Series", "Season", "Episode", "MusicAlbum", "MusicArtist", "Audio"]
+    for t in ["Movie", "Series", "Season", "Episode", "MusicAlbum", "MusicArtist", "Audio", "AudioBook", "Book"]
 ]
+# Upstream collections (Jellyfin BoxSets), created after the scan: name -> member movies.
+COLLECTIONS = {"a": {"Test Pattern Collection": ["Colour Bars (1971)", "Long Test Pattern"]}}
 
 
 def call(base, method, path, body=None, token=None, query=None):
@@ -121,6 +123,15 @@ def setup_server(name, spec, creds):
         if stable >= 3:
             break
     print(f"{name}: scan settled at {last} items")
+
+    have = {b["Name"] for b in call(base, "GET", "/Items", token=token, query={"Recursive": "true", "IncludeItemTypes": "BoxSet"})["Items"]}
+    for cname, members in COLLECTIONS.get(name, {}).items():
+        if cname in have:
+            continue
+        movies = call(base, "GET", "/Items", token=token, query={"Recursive": "true", "IncludeItemTypes": "Movie"})["Items"]
+        ids = [m["Id"] for m in movies if m["Name"] in members]
+        call(base, "POST", "/Collections", token=token, query={"name": cname, "ids": ",".join(ids)})
+        print(f"{name}: created collection {cname}")
 
 
 def write_jellybloom_config(rig):

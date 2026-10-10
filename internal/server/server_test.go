@@ -56,6 +56,7 @@ type fakeUpstream struct {
 	lastRaw []byte
 	history []recorded
 	media   map[string][]map[string]any // real item ID -> PlaybackInfo media sources
+	members map[string][]string         // real collection ID -> member IDs (Jellyfin links them)
 }
 
 type recorded struct {
@@ -172,6 +173,14 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Got-Range", r.Header.Get("Range"))
 		w.WriteHeader(http.StatusPartialContent)
 		w.Write([]byte("BYTES " + aOnly + " " + tok))
+		return
+	}
+	if ids, ok := f.members[q.Get("ParentId")]; ok && r.URL.Path == "/Items" {
+		var items []map[string]any
+		for _, id := range ids {
+			items = append(items, map[string]any{"Id": id})
+		}
+		writeJSON(w, map[string]any{"Items": items, "TotalRecordCount": len(items)})
 		return
 	}
 	if r.URL.Query().Get("list") == "1" {
@@ -1101,5 +1110,119 @@ func TestPlaylistsAndCollections(t *testing.T) {
 	}
 	if r := e.do("GET", "/Playlists/"+pl, e.token, nil); r.code != 404 {
 		t.Errorf("deleted playlist = %d", r.code)
+	}
+}
+
+func dashed(id string) string {
+	return id[:8] + "-" + id[8:12] + "-" + id[12:16] + "-" + id[16:20] + "-" + id[20:]
+}
+
+func TestPlaylistSortingAndDashedIDs(t *testing.T) {
+	e := newEnv(t, identity.Mode{})
+	e.login()
+	a, b, sh := e.uid("a", aOnly), e.uid("b", bOnly), e.uid("a", shared["a"])
+	pl := e.do("POST", "/Playlists", e.token, map[string]any{"Name": "Mix", "Ids": []string{b, sh, a}}).json(t)["Id"].(string)
+	names := func(path string) []string {
+		var out []string
+		for _, it := range e.do("GET", path, e.token, nil).json(t)["Items"].([]any) {
+			out = append(out, it.(map[string]any)["Name"].(string))
+		}
+		return out
+	}
+	if got := names("/Items?ParentId=" + pl); !slices.Equal(got, []string{"B", "Shared", "A"}) {
+		t.Errorf("list order = %v", got)
+	}
+	if got := names("/Items?ParentId=" + pl + "&SortBy=SortName"); !slices.Equal(got, []string{"A", "B", "Shared"}) {
+		t.Errorf("sorted by name = %v", got)
+	}
+	seen := map[string]bool{}
+	for range 30 {
+		seen[strings.Join(names("/Items?ParentId="+pl+"&SortBy=Random"), ",")] = true
+	}
+	if len(seen) < 2 {
+		t.Errorf("SortBy=Random (shuffle) never changed the order: %v", seen)
+	}
+
+	// Jellyfin 12.2 clients send dashed GUIDs in paths.
+	if r := e.do("POST", "/Playlists/"+dashed(pl)+"/Items?ids="+dashed(a), e.token, nil); r.code != 204 {
+		t.Errorf("add via dashed IDs = %d", r.code)
+	}
+	col := e.do("POST", "/Collections?name=Duo&ids="+a, e.token, nil).json(t)["Id"].(string)
+	if r := e.do("POST", "/Collections/"+dashed(col)+"/Items?ids="+b, e.token, nil); r.code != 204 {
+		t.Errorf("add to collection via dashed ID = %d", r.code)
+	}
+	if got := names("/Items?ParentId=" + dashed(col)); len(got) != 2 {
+		t.Errorf("collection via dashed ID = %v", got)
+	}
+
+	// Playlists and collections can be favorited and marked played, as in Jellyfin.
+	if r := e.do("POST", "/UserFavoriteItems/"+pl, e.token, nil); r.code != 200 {
+		t.Errorf("favorite playlist = %d", r.code)
+	}
+	if d := e.do("GET", "/Items/"+pl, e.token, nil).json(t); ud(t, d)["IsFavorite"] != true {
+		t.Errorf("playlist user data = %v", d["UserData"])
+	}
+	if r := e.do("POST", "/UserPlayedItems/"+col, e.token, nil); r.code != 200 {
+		t.Errorf("mark collection played = %d", r.code)
+	}
+	if d := e.do("GET", "/Items/"+b, e.token, nil).json(t); ud(t, d)["Played"] != true {
+		t.Errorf("collection member not marked played: %v", d["UserData"])
+	}
+}
+
+func TestUpstreamCollections(t *testing.T) {
+	saga := hexID("c5")
+	data := map[string]library{"a": {
+		views: []map[string]any{{"Id": hexID("va"), "Name": "Movies", "CollectionType": "movies"},
+			{"Id": hexID("vc"), "Name": "Collections", "CollectionType": "boxsets"}},
+		items: map[string][]map[string]any{
+			hexID("va"): defaultData["a"].items[hexID("va")],
+			// Jellyfin lists only the BoxSet under its library; members are linked.
+			hexID("vc"): {{"Id": saga, "Type": "BoxSet", "Name": "Saga", "IsFolder": true, "ParentId": hexID("vc"), "ChildCount": 2}},
+		},
+	}, "b": defaultData["b"]}
+	e := newEnvWith(t, identity.Mode{}, data)
+	e.a.members = map[string][]string{saga: {aOnly, shared["a"]}}
+	e.login()
+	sagaID, a, b, sh := e.uid("a", saga), e.uid("a", aOnly), e.uid("b", bOnly), e.uid("a", shared["a"])
+	members := func() []string {
+		var out []string
+		for _, it := range e.do("GET", "/Items?ParentId="+sagaID+"&SortBy=SortName", e.token, nil).json(t)["Items"].([]any) {
+			out = append(out, it.(map[string]any)["Id"].(string))
+		}
+		return out
+	}
+	if got := members(); !slices.Equal(got, []string{a, sh}) {
+		t.Fatalf("upstream collection members = %v, want %v", got, []string{a, sh})
+	}
+	// Edits are kept in JellyBloom; the upstream is not asked to change.
+	if r := e.do("POST", "/Collections/"+sagaID+"/Items?ids="+b, e.token, nil); r.code != 204 {
+		t.Errorf("add to upstream collection = %d", r.code)
+	}
+	if r := e.do("DELETE", "/Collections/"+sagaID+"/Items?ids="+sh, e.token, nil); r.code != 204 {
+		t.Errorf("remove from upstream collection = %d", r.code)
+	}
+	if got := members(); !slices.Equal(got, []string{a, b}) {
+		t.Errorf("after edits = %v, want %v", got, []string{a, b})
+	}
+	for _, rq := range e.a.history {
+		if rq.method != "GET" {
+			t.Errorf("upstream got a %s %s: collections must not be changed upstream", rq.method, rq.path)
+		}
+	}
+	// Marking a collection played marks its members.
+	if r := e.do("POST", "/UserPlayedItems/"+sagaID, e.token, nil); r.code != 200 {
+		t.Errorf("mark upstream collection played = %d", r.code)
+	}
+	for _, id := range []string{a, b} {
+		if d := e.do("GET", "/Items/"+id, e.token, nil).json(t); ud(t, d)["Played"] != true {
+			t.Errorf("member %s not marked played: %v", id, ud(t, d))
+		}
+	}
+	if r := e.do("DELETE", "/Items/"+sagaID, e.token, nil); r.code != 403 {
+		t.Errorf("deleting an upstream collection = %d, want 403", r.code)
+	}
+	if r := e.do("POST", "/Collections/"+a+"/Items?ids="+b, e.token, nil); r.code != 404 {
+		t.Errorf("adding to a movie = %d, want 404", r.code)
 	}
 }

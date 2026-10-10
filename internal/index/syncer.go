@@ -18,6 +18,7 @@ type Source interface {
 	Name() string
 	Views(ctx context.Context) (*upstream.QueryResult, error)
 	Items(ctx context.Context, q upstream.ItemsQuery) (*upstream.QueryResult, error)
+	Ancestors(ctx context.Context, id string) ([]json.RawMessage, error)
 	EachItemPage(ctx context.Context, q upstream.ItemsQuery, pageSize int, fn func(*upstream.QueryResult) error) error
 	EachArtistPage(ctx context.Context, q upstream.ItemsQuery, pageSize int, fn func(*upstream.QueryResult) error) error
 	Listen(ctx context.Context, handle func(upstream.Event)) error
@@ -209,6 +210,54 @@ func mergeChange(pending map[string]bool, lc *upstream.LibraryChange) {
 	}
 }
 
+func normID(id string) string { return strings.ToLower(strings.ReplaceAll(id, "-", "")) }
+
+// libraries returns the indexed libraries an item belongs to ("" for none),
+// from its ancestors; Jellyfin reports a library's physical folders through
+// the library itself. newLibrary reports that the item is a library, or sits
+// in one the index lacks. Library root folders and items outside the
+// libraries (no library ancestor) keep the membership they have.
+func (s *Syncer) libraries(ctx context.Context, h dtoHeader, known map[string]string) (libs []string, newLibrary bool, err error) {
+	switch h.Type {
+	case "CollectionFolder", "UserView", "UserRootFolder", "AggregateFolder":
+		return nil, true, nil
+	}
+	ancestors, err := s.src.Ancestors(ctx, h.Id)
+	if err != nil {
+		return nil, false, fmt.Errorf("ancestors of %s: %w", h.Id, err)
+	}
+	rootFolder := false
+	for _, raw := range ancestors {
+		a, err := parseHeader(raw)
+		if err != nil {
+			return nil, false, err
+		}
+		switch a.Type {
+		case "AggregateFolder":
+			rootFolder = true
+		case "CollectionFolder", "UserView":
+			if v := known[normID(a.Id)]; v != "" {
+				libs = append(libs, v)
+			} else {
+				newLibrary = true
+			}
+		}
+	}
+	if libs != nil || newLibrary {
+		return libs, newLibrary, nil
+	}
+	it, err := s.store.Item(ctx, s.src.Name(), h.Id)
+	switch {
+	case err != nil:
+		return nil, false, err
+	case it != nil && len(it.Views) > 0:
+		return it.Views, false, nil
+	case rootFolder:
+		return nil, true, nil // a folder added to a library: full sync learns its roots
+	}
+	return []string{""}, false, nil
+}
+
 // FullSync replaces the upstream's snapshot with a fresh one. On failure the
 // previous snapshot keeps serving.
 func (s *Syncer) FullSync(ctx context.Context) (err error) {
@@ -300,9 +349,14 @@ func (s *Syncer) FullSync(ctx context.Context) (err error) {
 	return nil
 }
 
-// applyChanges re-fetches changed items, resolving which views each belongs
+// maxIncremental is the most changed items applied one by one; a larger
+// burst (a big scan) is cheaper as one full sync.
+const maxIncremental = 200
+
+// applyChanges re-fetches changed items, finds which libraries each belongs
 // to, and deletes removed ones. Items no longer visible upstream are removed.
-// Library-level changes trigger a full sync instead.
+// Changes to libraries themselves, or items in a library the index does not
+// have yet, trigger a full sync instead.
 func (s *Syncer) applyChanges(ctx context.Context, pending map[string]bool) error {
 	if len(pending) == 0 {
 		return nil
@@ -311,54 +365,34 @@ func (s *Syncer) applyChanges(ctx context.Context, pending map[string]bool) erro
 	if err != nil {
 		return err
 	}
-	viewIDs := map[string]bool{}
+	known := map[string]string{} // normalized ID -> stored view ID
 	for _, v := range views {
-		viewIDs[v.ID] = true
+		known[normID(v.ID)] = v.ID
 	}
 
 	var upsertIDs, removed []string
+	resync := false
 	for id, upsert := range pending {
-		if viewIDs[id] {
-			s.RequestFullSync() // a library itself changed
-			continue
-		}
-		if upsert {
+		switch {
+		case known[normID(id)] != "":
+			resync = true // a library itself changed
+		case upsert:
 			upsertIDs = append(upsertIDs, id)
-		} else {
+		default:
 			removed = append(removed, id)
 		}
+	}
+	if len(upsertIDs) > maxIncremental {
+		resync, upsertIDs = true, nil // removals still apply now
 	}
 	slices.Sort(upsertIDs)
 
 	upserts := map[string][]json.RawMessage{}
 	for batch := range slices.Chunk(upsertIDs, s.opts.BatchSize) {
-		found := map[string]bool{}
-		for _, v := range views {
-			res, err := s.src.Items(ctx, upstream.ItemsQuery{IDs: batch, ParentID: v.ID, Recursive: true, Fields: SyncFields})
-			if err != nil {
-				return err
-			}
-			for _, raw := range res.Items {
-				h, err := parseHeader(raw)
-				if err != nil {
-					return err
-				}
-				found[h.Id] = true
-				upserts[v.ID] = append(upserts[v.ID], raw)
-			}
-		}
-		var orphans []string
-		for _, id := range batch {
-			if !found[id] {
-				orphans = append(orphans, id)
-			}
-		}
-		if len(orphans) == 0 {
-			continue
-		}
-		// Not under any known library: either a new library (resync) or an
-		// item outside the libraries (index it without a view), or gone.
-		res, err := s.src.Items(ctx, upstream.ItemsQuery{IDs: orphans, Fields: SyncFields})
+		// Jellyfin (12.2) ignores ParentId when Ids is given, so a library
+		// cannot be asked whether it holds an item: fetch the items, then
+		// look up each one's library among its ancestors.
+		res, err := s.src.Items(ctx, upstream.ItemsQuery{IDs: batch, Fields: SyncFields})
 		if err != nil {
 			return err
 		}
@@ -369,17 +403,27 @@ func (s *Syncer) applyChanges(ctx context.Context, pending map[string]bool) erro
 				return err
 			}
 			seen[h.Id] = true
-			if h.Type == "CollectionFolder" || h.Type == "UserView" {
-				s.RequestFullSync()
+			libs, newLibrary, err := s.libraries(ctx, h, known)
+			if err != nil {
+				return err
+			}
+			if newLibrary {
+				resync = true
 				continue
 			}
-			upserts[""] = append(upserts[""], raw)
+			for _, v := range libs {
+				upserts[v] = append(upserts[v], raw)
+			}
 		}
-		for _, id := range orphans {
+		for _, id := range batch {
 			if !seen[id] {
 				removed = append(removed, id)
 			}
 		}
+	}
+	if resync {
+		s.log.Debug("changes need a full sync")
+		s.RequestFullSync()
 	}
 
 	if err := s.store.ApplyChanges(ctx, s.src.Name(), upserts, removed); err != nil {

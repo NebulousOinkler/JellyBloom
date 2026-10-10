@@ -168,70 +168,123 @@ func (c *Catalog) Resume(ctx context.Context, q Query, o DTOOptions) (*QueryResu
 	return c.result(ctx, s, page(hits, q.StartIndex, q.Limit), o)
 }
 
-// NextUpOptions shapes NextUp.
+// NextUpOptions shapes NextUp (Jellyfin's /Shows/NextUp parameters).
 type NextUpOptions struct {
-	SeriesID, ParentID  string
-	StartIndex, Limit   int
-	SkipResumable       bool // don't offer an in-progress episode (Jellyfin's enableResumable=false)
-	DisableFirstEpisode bool // with SeriesID: no first episode for an unwatched series
+	SeriesID, ParentID string
+	StartIndex, Limit  int
+	SkipResumable      bool      // enableResumable=false: a series whose next episode is in progress offers nothing
+	Rewatching         bool      // enableRewatching: also offer the next played episode after the most recently played one
+	Cutoff             time.Time // nextUpDateCutoff: leave out series last watched before this
 }
 
-// NextUp returns, per series the user is watching, the next episode after
-// the most recently played one, series most recently watched first. Specials
-// (season 0) are skipped. With SeriesID, an unwatched series offers its first
-// episode.
+// NextUp follows Jellyfin 12.2 (checked against a real server). The series
+// are those with any episode the user has played or started (last watched
+// at or after Cutoff), most recently watched first; with SeriesID, just that
+// one. Each offers the first unplayed episode after its furthest played
+// one, or its first unplayed episode when none is played. Specials
+// (season 0) are never offered. With Rewatching, each series also offers
+// the next played episode after its most recently played one, and all
+// offers are ordered by when their anchor episode was played.
 func (c *Catalog) NextUp(ctx context.Context, n NextUpOptions, o DTOOptions) (*QueryResult, error) {
 	s := c.snap.Load()
 	user, err := c.allUserData(ctx, o.UserID)
 	if err != nil {
 		return nil, err
 	}
-	type pick struct {
-		ep   *node
-		when time.Time
+	type series struct {
+		id     string
+		eps    []*node // in order, specials excluded
+		recent time.Time
 	}
-	episodes := map[string][]*node{}
+	byID := map[string]*series{}
 	for _, e := range s.all {
-		if e.typ == "Episode" && e.series != "" && e.parentIndex != 0 {
-			episodes[e.series] = append(episodes[e.series], e)
+		if e.typ != "Episode" || e.series == "" {
+			continue
+		}
+		sr := byID[e.series]
+		if sr == nil {
+			sr = &series{id: e.series}
+			byID[e.series] = sr
+		}
+		if t := user[e.id].LastPlayed; t.After(sr.recent) {
+			sr.recent = t
+		}
+		if e.parentIndex != 0 {
+			sr.eps = append(sr.eps, e)
 		}
 	}
-	var picks []pick
-	for series, eps := range episodes {
-		if n.SeriesID != "" && series != identity.NormalizeID(n.SeriesID) {
+	var keys []*series
+	for _, sr := range byID {
+		switch {
+		case n.SeriesID != "":
+			if sr.id != identity.NormalizeID(n.SeriesID) {
+				continue
+			}
+		case sr.recent.IsZero() || sr.recent.Before(n.Cutoff):
 			continue
 		}
 		if n.ParentID != "" {
-			if sn := s.nodes[series]; sn == nil || !slices.Contains(sn.views, identity.NormalizeID(n.ParentID)) {
+			if sn := s.nodes[sr.id]; sn == nil || !slices.Contains(sn.views, identity.NormalizeID(n.ParentID)) {
 				continue
 			}
 		}
-		slices.SortFunc(eps, func(a, b *node) int {
+		slices.SortFunc(sr.eps, func(a, b *node) int {
 			return cmp.Or(cmp.Compare(a.parentIndex, b.parentIndex), cmp.Compare(a.index, b.index))
 		})
-		last, lastAt := -1, time.Time{}
-		for i, e := range eps {
-			if r := user[e.id]; r.Played && (last < 0 || r.LastPlayed.After(lastAt)) {
-				last, lastAt = i, r.LastPlayed
+		keys = append(keys, sr)
+	}
+	slices.SortFunc(keys, func(a, b *series) int { return cmp.Or(b.recent.Compare(a.recent), strings.Compare(a.id, b.id)) })
+
+	type pick struct {
+		ep   *node
+		when time.Time // the anchor episode's last played date
+	}
+	// next offers the first episode after anchor (-1: from the start) whose
+	// played state is played, unless it is in progress and SkipResumable.
+	next := func(eps []*node, anchor int, played bool) *node {
+		for _, e := range eps[anchor+1:] {
+			if r := user[e.id]; r.Played == played {
+				if n.SkipResumable && r.Resumable() {
+					return nil
+				}
+				return e
 			}
 		}
-		start := last + 1
-		if last < 0 {
-			if n.SeriesID == "" || n.DisableFirstEpisode {
-				continue // not watching this series
+		return nil
+	}
+	var picks []pick
+	for _, sr := range keys {
+		furthest := -1
+		for i, e := range sr.eps {
+			if user[e.id].Played {
+				furthest = i
 			}
-			start = 0
 		}
-		for _, e := range eps[start:] {
-			r := user[e.id]
-			if r.Played || r.Resumable() && n.SkipResumable {
-				continue
-			}
-			picks = append(picks, pick{e, lastAt})
-			break
+		var when time.Time
+		if furthest >= 0 {
+			when = user[sr.eps[furthest].id].LastPlayed
+		}
+		if e := next(sr.eps, furthest, false); e != nil {
+			picks = append(picks, pick{e, when})
 		}
 	}
-	slices.SortFunc(picks, func(a, b pick) int { return cmp.Or(b.when.Compare(a.when), strings.Compare(a.ep.id, b.ep.id)) })
+	if n.Rewatching {
+		for _, sr := range keys {
+			recent := -1
+			for i, e := range sr.eps { // latest play wins; ties go to the later episode
+				if r := user[e.id]; r.Played && (recent < 0 || !r.LastPlayed.Before(user[sr.eps[recent].id].LastPlayed)) {
+					recent = i
+				}
+			}
+			if recent < 0 {
+				continue
+			}
+			if e := next(sr.eps, recent, true); e != nil {
+				picks = append(picks, pick{e, user[sr.eps[recent].id].LastPlayed})
+			}
+		}
+		slices.SortStableFunc(picks, func(a, b pick) int { return b.when.Compare(a.when) })
+	}
 	var hits []*node
 	for _, p := range picks {
 		hits = append(hits, p.ep)
@@ -258,6 +311,64 @@ func (c *Catalog) MediaType(id string) string {
 		return n.mediaType
 	}
 	return ""
+}
+
+// Type returns an item's Jellyfin type ("Movie", "BoxSet", …), or "".
+func (c *Catalog) Type(id string) string {
+	if n := c.snap.Load().nodes[identity.NormalizeID(id)]; n != nil {
+		return n.typ
+	}
+	return ""
+}
+
+// Copies returns the upstream copies of a visible item, preferred first.
+func (c *Catalog) Copies(id string) []identity.Ref {
+	n := c.snap.Load().nodes[identity.NormalizeID(id)]
+	if n == nil {
+		return nil
+	}
+	out := make([]identity.Ref, len(n.copies))
+	for i, r := range n.copies {
+		out[i] = identity.Ref{Upstream: r.up, ID: r.id, Source: true}
+	}
+	return out
+}
+
+// Visible returns the visible unified ID of an upstream item, or "".
+func (c *Catalog) Visible(upstream, realID string) string {
+	s := c.snap.Load()
+	u := s.byRef[ref{upstream, identity.NormalizeID(realID)}]
+	if s.nodes[u] == nil {
+		return ""
+	}
+	return u
+}
+
+// Order returns the distinct visible ids in the order a query with these
+// sort keys would list them; user-data keys use userID's data.
+func (c *Catalog) Order(ctx context.Context, ids, sortBy, sortOrder []string, userID string) ([]string, error) {
+	q := Query{IDs: slices.Compact(slices.Sorted(slices.Values(ids))), SortBy: sortBy, SortOrder: sortOrder}
+	if q.needsUser() {
+		var err error
+		if q.user, err = c.allUserData(ctx, userID); err != nil {
+			return nil, err
+		}
+	}
+	return c.snap.Load().run(q).IDs, nil
+}
+
+// PlaybackItem returns what playback rules need to know about an item.
+func (c *Catalog) PlaybackItem(id string) userdata.Item {
+	n := c.snap.Load().nodes[identity.NormalizeID(id)]
+	switch {
+	case n == nil:
+		return userdata.Item{}
+	case n.typ == "AudioBook":
+		return userdata.Item{Runtime: n.runtime, Kind: userdata.KindAudioBook}
+	case n.mediaType == "Audio":
+		return userdata.Item{Runtime: n.runtime, Kind: userdata.KindAudio}
+	}
+	return userdata.Item{Runtime: n.runtime, Kind: userdata.KindVideo}
 }
 
 // Runtime returns an item's runtime in ticks (0 if unknown).
@@ -293,7 +404,15 @@ func (c *Catalog) userDataDTOs(ctx context.Context, s *snapshot, userID string, 
 			}
 		}
 	}
-	recs, err := c.o.UserData.Get(ctx, userID, need)
+	// Many leaves (a page of series): one scan of the user's records beats
+	// hundreds of chunked lookups.
+	get := c.o.UserData.Get
+	if len(need) > 2000 {
+		get = func(ctx context.Context, userID string, _ []string) (map[string]userdata.Record, error) {
+			return c.o.UserData.All(ctx, userID)
+		}
+	}
+	recs, err := get(ctx, userID, need)
 	if err != nil {
 		return nil, err
 	}
@@ -313,7 +432,7 @@ func (c *Catalog) userDataDTOs(ctx context.Context, s *snapshot, userID string, 
 			r.Played = len(ls) > 0 && unplayed == 0
 			d := r.DTO(id, 0)
 			d["UnplayedItemCount"] = unplayed
-			if len(ls) > 0 && unplayed < len(ls) {
+			if len(ls) > 0 {
 				d["PlayedPercentage"] = float64(len(ls)-unplayed) / float64(len(ls)) * 100
 			}
 			out[id] = d

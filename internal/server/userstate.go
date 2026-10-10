@@ -31,20 +31,17 @@ func (s *Server) userStateRoutes(rt *router) {
 
 	played := func(on bool) func(http.ResponseWriter, *http.Request, *caller) {
 		return func(w http.ResponseWriter, r *http.Request, c *caller) {
-			id, ok := s.knownItem(w, r)
+			id, ok := s.knownItem(w, r, c)
 			if !ok {
 				return
 			}
-			when := time.Now()
-			if v := readParams(r).str("datePlayed"); v != "" {
-				if t, err := time.Parse(time.RFC3339, v); err == nil {
-					when = t
-				}
-			}
-			// A series, season, or album is marked through its playable items.
-			s.updateUserData(w, r, c, id, s.catalog.Leaves(id), func(rec *userdata.Record) {
+			date := readParams(r).time("datePlayed")
+			now := time.Now()
+			// A series, season, album, collection, or playlist is marked
+			// through its playable items.
+			s.updateUserData(w, r, c, id, s.leavesOf(r, c, id), func(rec *userdata.Record) {
 				if on {
-					userdata.MarkPlayed(rec, when)
+					userdata.MarkPlayed(rec, date, now)
 				} else {
 					userdata.MarkUnplayed(rec)
 				}
@@ -56,7 +53,7 @@ func (s *Server) userStateRoutes(rt *router) {
 
 	favorite := func(on bool) func(http.ResponseWriter, *http.Request, *caller) {
 		return func(w http.ResponseWriter, r *http.Request, c *caller) {
-			if id, ok := s.knownItem(w, r); ok {
+			if id, ok := s.knownItem(w, r, c); ok {
 				s.updateUserData(w, r, c, id, []string{id}, func(rec *userdata.Record) { rec.IsFavorite = on })
 			}
 		}
@@ -65,24 +62,24 @@ func (s *Server) userStateRoutes(rt *router) {
 	reg(http.MethodDelete, "/UserFavoriteItems/{itemId}", "/Users/{userId}/FavoriteItems/{itemId}", favorite(false))
 
 	reg(http.MethodPost, "/UserItems/{itemId}/Rating", "/Users/{userId}/Items/{itemId}/Rating", func(w http.ResponseWriter, r *http.Request, c *caller) {
-		if id, ok := s.knownItem(w, r); ok {
+		if id, ok := s.knownItem(w, r, c); ok {
 			likes := readParams(r).boolPtr("likes")
 			s.updateUserData(w, r, c, id, []string{id}, func(rec *userdata.Record) { rec.Likes = likes })
 		}
 	})
 	reg(http.MethodDelete, "/UserItems/{itemId}/Rating", "/Users/{userId}/Items/{itemId}/Rating", func(w http.ResponseWriter, r *http.Request, c *caller) {
-		if id, ok := s.knownItem(w, r); ok {
+		if id, ok := s.knownItem(w, r, c); ok {
 			s.updateUserData(w, r, c, id, []string{id}, func(rec *userdata.Record) { rec.Likes = nil })
 		}
 	})
 
 	reg(http.MethodGet, "/UserItems/{itemId}/UserData", "/Users/{userId}/Items/{itemId}/UserData", func(w http.ResponseWriter, r *http.Request, c *caller) {
-		if id, ok := s.knownItem(w, r); ok {
+		if id, ok := s.knownItem(w, r, c); ok {
 			s.writeUserData(w, r, c, id)
 		}
 	})
 	reg(http.MethodPost, "/UserItems/{itemId}/UserData", "/Users/{userId}/Items/{itemId}/UserData", func(w http.ResponseWriter, r *http.Request, c *caller) {
-		id, ok := s.knownItem(w, r)
+		id, ok := s.knownItem(w, r, c)
 		if !ok {
 			return
 		}
@@ -130,14 +127,34 @@ func (s *Server) userStateRoutes(rt *router) {
 	reg(http.MethodDelete, "/PlayingItems/{itemId}", "/Users/{userId}/PlayingItems/{itemId}", s.legacyReport(userdata.Stop))
 }
 
-// knownItem reads {itemId} and checks it names a visible item.
-func (s *Server) knownItem(w http.ResponseWriter, r *http.Request) (string, bool) {
+// knownItem reads {itemId} and checks it names a visible item or one of the
+// caller's playlists or JellyBloom's collections.
+func (s *Server) knownItem(w http.ResponseWriter, r *http.Request, c *caller) (string, bool) {
 	id := identity.NormalizeID(r.PathValue("itemId"))
-	if !s.catalog.Known(id) {
+	if !s.catalog.Known(id) && !s.isLocalList(r.Context(), c, id) {
 		http.NotFound(w, r)
 		return "", false
 	}
 	return id, true
+}
+
+// leavesOf returns the playable items a played mark on id covers: the item
+// itself, a folder's items, or the items of a collection's or playlist's
+// members.
+func (s *Server) leavesOf(r *http.Request, c *caller, id string) []string {
+	var members []string
+	if p, err := s.ud.Playlist(r.Context(), c.user.ID, id); err == nil {
+		members = p.ItemIDs()
+	} else if s.isCollection(r.Context(), id) {
+		members, _ = s.collectionMembers(r, c, id)
+	} else {
+		return s.catalog.Leaves(id)
+	}
+	var out []string
+	for _, m := range members {
+		out = append(out, s.catalog.Leaves(m)...)
+	}
+	return out
 }
 
 // updateUserData applies fn to ids, then answers with item's user data and
@@ -223,9 +240,9 @@ func (s *Server) recordPlayback(r *http.Request, c *caller, id string, rep userd
 	if !s.catalog.Known(id) {
 		return
 	}
-	runtime := s.catalog.Runtime(id)
+	item := s.catalog.PlaybackItem(id)
 	_, err := s.ud.Update(r.Context(), c.user.ID, []string{id}, func(rec *userdata.Record) {
-		userdata.Apply(rec, rep, runtime, time.Now())
+		userdata.Apply(rec, rep, item, time.Now())
 	})
 	if err != nil {
 		s.log.Error("recording playback", "err", err)

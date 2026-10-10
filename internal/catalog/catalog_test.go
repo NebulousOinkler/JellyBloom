@@ -462,6 +462,9 @@ func TestRootFoldersAreTransparent(t *testing.T) {
 	}
 }
 
+// at returns a time to mark played on.
+func at(ms int64) *time.Time { t := time.UnixMilli(ms); return &t }
+
 func (f *fixture) set(user, up, real string, fn func(*userdata.Record)) {
 	f.t.Helper()
 	if _, err := f.ud.Update(context.Background(), user, []string{f.uid(up, real)}, fn); err != nil {
@@ -473,10 +476,10 @@ func TestUserDataOverlayAndFilters(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t, identity.Mode{})
 	o := DTOOptions{UserID: "u1"}
-	f.set("u1", "a", e1a, func(r *userdata.Record) { userdata.MarkPlayed(r, time.UnixMilli(2000)) })
+	f.set("u1", "a", e1a, func(r *userdata.Record) { userdata.MarkPlayed(r, at(2000), time.Time{}) })
 	f.set("u1", "a", m1a, func(r *userdata.Record) { r.IsFavorite = true })
 	f.set("u1", "a", m2a, func(r *userdata.Record) { r.Position, r.LastPlayed = 50, time.UnixMilli(3000) })
-	f.set("u2", "a", e2a, func(r *userdata.Record) { userdata.MarkPlayed(r, time.UnixMilli(1)) }) // another user
+	f.set("u2", "a", e2a, func(r *userdata.Record) { userdata.MarkPlayed(r, at(1), time.Time{}) }) // another user
 
 	series, _ := f.cat.Item(ctx, f.uid("a", sa), o)
 	ud := series["UserData"].(map[string]any)
@@ -520,7 +523,7 @@ func TestUserDataOverlayAndFilters(t *testing.T) {
 	}
 
 	// Marking the remaining episode played completes the series.
-	f.set("u1", "a", e2a, func(r *userdata.Record) { userdata.MarkPlayed(r, time.UnixMilli(4000)) })
+	f.set("u1", "a", e2a, func(r *userdata.Record) { userdata.MarkPlayed(r, at(4000), time.Time{}) })
 	series, _ = f.cat.Item(ctx, f.uid("a", sa), o)
 	if ud := series["UserData"].(map[string]any); ud["Played"] != true || ud["UnplayedItemCount"] != 0 {
 		t.Errorf("completed series = %v", ud)
@@ -542,7 +545,7 @@ func TestResumeNextUpLatest(t *testing.T) {
 		t.Errorf("unwatched series with SeriesID = %v, want its first episode", got)
 	}
 
-	f.set("u1", "a", e1a, func(r *userdata.Record) { userdata.MarkPlayed(r, time.UnixMilli(2000)) })
+	f.set("u1", "a", e1a, func(r *userdata.Record) { userdata.MarkPlayed(r, at(2000), time.Time{}) })
 	nu, _ = f.cat.NextUp(ctx, NextUpOptions{}, o)
 	if got := names(nu.Items); !slices.Equal(got, []string{"Two"}) {
 		t.Errorf("next up = %v", got)
@@ -575,5 +578,100 @@ func TestResumeNextUpLatest(t *testing.T) {
 	latest, _ := f.cat.Latest(ctx, f.viewID("Shows"), nil, false, true, 10, o)
 	if got := names(latest); !slices.Equal(got, []string{"Two"}) {
 		t.Errorf("latest hiding played = %v", got)
+	}
+}
+
+// TestNextUpMatchesJellyfin replays scenarios run against a real Jellyfin
+// 12.2 server (testrig) and expects the same answers.
+func TestNextUpMatchesJellyfin(t *testing.T) {
+	ctx := context.Background()
+	idx, err := index.Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { idx.Close() })
+	lib, show, other := g("d1"), g("d2"), g("d3")
+	ep := func(id, series, name string, season, n int) dto {
+		return dto{"Id": id, "Type": "Episode", "Name": name, "ParentId": series, "SeriesId": series,
+			"ParentIndexNumber": season, "IndexNumber": n, "RunTimeTicks": 600 * 10_000_000, "MediaType": "Video"}
+	}
+	eps := map[string]string{"S1E1": g("e11"), "S1E2": g("e12"), "S1E3": g("e13"), "S1E4": g("e14"), "S2E1": g("e21"), "S0E1": g("e01")}
+	items := []dto{
+		{"Id": show, "Type": "Series", "Name": "Show", "IsFolder": true, "ParentId": lib, "ProviderIds": dto{"Tvdb": "1"}},
+		{"Id": other, "Type": "Series", "Name": "Other", "IsFolder": true, "ParentId": lib, "ProviderIds": dto{"Tvdb": "2"}},
+		ep(g("f11"), other, "Other S1E1", 1, 1), ep(g("f12"), other, "Other S1E2", 1, 2),
+	}
+	for name, id := range eps {
+		items = append(items, ep(id, show, name, int(name[1]-'0'), int(name[3]-'0')))
+	}
+	put(t, idx, "a", []dto{{"Id": lib, "Name": "Shows", "CollectionType": "tvshows"}}, map[string][]dto{lib: items})
+	res, _ := identity.New(idx, identity.Mode{Op: identity.Union, Upstreams: []string{"a"}}, nil)
+	ud, _ := userdata.Open(idx.DB())
+	cat := New(Options{DB: idx.DB(), Resolver: res, Upstreams: []string{"a"}, ServerID: "s", UserData: ud})
+	res.OnRebuild(func(ctx context.Context) { cat.Reload(ctx) })
+	if _, err := res.Rebuild(ctx); err != nil {
+		t.Fatal(err)
+	}
+	uid := func(real string) string { id, _ := res.UnifiedID(ctx, "a", real); return id }
+	day := func(d int) *time.Time { t := time.Date(2026, 10, d, 12, 0, 0, 0, time.UTC); return &t }
+	type step struct {
+		ep  string
+		day int // played on this day; 0: in progress instead
+	}
+	cases := []struct {
+		name  string
+		steps []step
+		opts  NextUpOptions
+		want  []string
+	}{
+		{"one played", []step{{"S1E1", 1}}, NextUpOptions{}, []string{"S1E2"}},
+		{"gap: continue after the furthest", []step{{"S1E1", 1}, {"S1E2", 2}, {"S1E4", 3}}, NextUpOptions{}, []string{"S2E1"}},
+		{"rewatched an early episode last", []step{{"S1E1", 1}, {"S1E2", 2}, {"S1E4", 3}, {"S1E1", 5}}, NextUpOptions{}, []string{"S2E1"}},
+		{"rewatching", []step{{"S1E1", 1}, {"S1E2", 2}, {"S1E4", 3}, {"S1E1", 5}}, NextUpOptions{Rewatching: true}, []string{"S1E2", "S2E1"}},
+		{"rewatching: next played episode", []step{{"S1E4", 1}, {"S1E1", 2}}, NextUpOptions{Rewatching: true, SkipResumable: true}, []string{"S1E4", "S2E1"}},
+		{"rewatching, all played", []step{{"S1E1", 1}, {"S1E2", 2}, {"S1E3", 3}, {"S1E4", 4}, {"S2E1", 5}}, NextUpOptions{Rewatching: true}, nil},
+		{"next is in progress", []step{{"S1E1", 1}, {"S1E2", 0}}, NextUpOptions{}, []string{"S1E2"}},
+		{"next is in progress, resumable disabled", []step{{"S1E1", 1}, {"S1E2", 0}}, NextUpOptions{SkipResumable: true}, nil},
+		{"last watched before the cutoff", []step{{"S1E1", 1}}, NextUpOptions{Cutoff: *day(5)}, nil},
+		{"nothing played, one started", []step{{"S1E3", 0}}, NextUpOptions{}, []string{"S1E1"}},
+		{"nothing watched", nil, NextUpOptions{}, nil},
+		{"nothing watched, by series", nil, NextUpOptions{SeriesID: uid(show)}, []string{"S1E1"}},
+		{"specials are never offered", []step{{"S0E1", 1}}, NextUpOptions{}, []string{"S1E1"}},
+	}
+	for _, c := range cases {
+		ud.Update(ctx, "u", slices.Collect(func(yield func(string) bool) {
+			for _, id := range eps {
+				yield(uid(id))
+			}
+		}), userdata.MarkUnplayed)
+		for _, s := range c.steps {
+			ud.Update(ctx, "u", []string{uid(eps[s.ep])}, func(r *userdata.Record) {
+				if s.day == 0 {
+					r.Position, r.LastPlayed = 300*10_000_000, *day(4)
+				} else {
+					userdata.MarkPlayed(r, day(s.day), time.Time{})
+				}
+			})
+		}
+		nu, err := cat.NextUp(ctx, c.opts, DTOOptions{UserID: "u"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := names(nu.Items); !slices.Equal(got, c.want) {
+			t.Errorf("%s: next up = %v, want %v", c.name, got, c.want)
+		}
+	}
+
+	// Series order: most recently watched first, by any episode's last play.
+	ud.Update(ctx, "u", []string{uid(eps["S1E1"])}, func(r *userdata.Record) { userdata.MarkPlayed(r, day(1), time.Time{}) })
+	ud.Update(ctx, "u", []string{uid(g("f11"))}, func(r *userdata.Record) { userdata.MarkPlayed(r, day(2), time.Time{}) })
+	nu, _ := cat.NextUp(ctx, NextUpOptions{}, DTOOptions{UserID: "u"})
+	if got := names(nu.Items); !slices.Equal(got, []string{"Other S1E2", "S1E2"}) {
+		t.Errorf("series order = %v", got)
+	}
+	ud.Update(ctx, "u", []string{uid(eps["S1E2"])}, func(r *userdata.Record) { r.Position, r.LastPlayed = 300*10_000_000, *day(3) })
+	nu, _ = cat.NextUp(ctx, NextUpOptions{}, DTOOptions{UserID: "u"})
+	if got := names(nu.Items); !slices.Equal(got, []string{"S1E2", "Other S1E2"}) {
+		t.Errorf("series order after starting an episode = %v", got)
 	}
 }

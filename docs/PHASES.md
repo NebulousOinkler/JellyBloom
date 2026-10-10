@@ -116,6 +116,35 @@ with the "done when" check from that table. Target upstream version: Jellyfin 10
   name, so same-named libraries share IDs across servers; item IDs differ. URLs use dashed
   GUIDs.
 
+## Fixes after phase 7 (checked against real Jellyfin 12.2)
+`testrig/compare.py` replays user-state steps on a real Jellyfin server and on JellyBloom
+and diffs the results; it found the first group, the rig the rest.
+- Playback rules now match Jellyfin exactly: progress reports apply the resume rules too; a
+  start counts a play without moving the position (and dates it only if not yet played);
+  music is played on start and never resumable; audiobooks use 5-minute rules; a stop
+  without a position is a full play; the play is dated only when a resume point is kept or
+  the item completes.
+- Mark played with a date counts a play on that date, without one keeps the existing
+  date; mark unplayed clears play count and last played. A rewatch (played, with a resume
+  point) shows in Continue Watching. Folders always carry `PlayedPercentage`.
+- Next Up anchors on the furthest played episode (not the most recent), offers a series'
+  first episode once any episode is started, orders series by their latest activity,
+  drops a series whose next episode is in progress when `enableResumable=false`, and
+  supports `enableRewatching` and `nextUpDateCutoff`. `disableFirstEpisode` is ignored, as
+  in Jellyfin 12.2.
+- Incremental sync put every changed item into every library of its upstream (Jellyfin
+  ignores `ParentId` with `Ids`; the unit-test fake did not). Libraries now come from
+  `/Items/{id}/Ancestors`, and libraries added upstream appear within seconds of
+  Jellyfin's change notice instead of at the next periodic resync.
+- Upstream collections showed empty (Jellyfin links BoxSet members); they now list their
+  members, and adding to or removing from them works (kept in JellyBloom).
+- Concurrent user-data and playlist edits failed with "database is locked" or lost
+  updates; they now take the write lock up front.
+- Playlist items honor `SortBy` (shuffle plays shuffled); playlist and collection routes
+  accept dashed GUIDs; playlists and collections can be favorited and marked played.
+- Rig: a 10-minute movie byte-identical on both servers, more episodes (two seasons), a
+  long track, an audiobook library, and a collection on server a.
+
 ## Phase 6.5: Upstream credentials (`internal/secrets`, `internal/pairing`, `internal/redact`)
 - [x] Config holds no upstream secrets; strict decoding rejects removed/unknown fields
 - [x] `jellybloom pair` via Quick Connect (default), `-password` (exchanged once), `-api-key` (opt-in);

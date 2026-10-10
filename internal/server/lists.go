@@ -1,11 +1,15 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -42,7 +46,7 @@ func (s *Server) listRoutes(rt *router) {
 		if b.Ids != nil {
 			items = s.knownIDs(b.Ids)
 		}
-		s.listResult(w, r, s.ud.UpdatePlaylist(r.Context(), c.user.ID, r.PathValue("id"), b.Name, items))
+		s.listResult(w, r, s.ud.UpdatePlaylist(r.Context(), c.user.ID, pathID(r), b.Name, items))
 	}))
 	rt.handle(http.MethodGet, "/Playlists/{id}/Items", a(func(w http.ResponseWriter, r *http.Request, c *caller) {
 		if p := s.playlist(w, r, c); p != nil {
@@ -50,11 +54,11 @@ func (s *Server) listRoutes(rt *router) {
 		}
 	}))
 	rt.handle(http.MethodPost, "/Playlists/{id}/Items", a(func(w http.ResponseWriter, r *http.Request, c *caller) {
-		s.listResult(w, r, s.ud.AddToPlaylist(r.Context(), c.user.ID, r.PathValue("id"), s.knownIDs(readParams(r).list("ids"))))
+		s.listResult(w, r, s.ud.AddToPlaylist(r.Context(), c.user.ID, pathID(r), s.knownIDs(readParams(r).list("ids"))))
 	}))
 	rt.handle(http.MethodDelete, "/Playlists/{id}/Items", a(func(w http.ResponseWriter, r *http.Request, c *caller) {
 		entries := readParams(r).list("entryIds")
-		s.listResult(w, r, s.ud.RemoveFromPlaylist(r.Context(), c.user.ID, r.PathValue("id"), normalizeAll(entries)))
+		s.listResult(w, r, s.ud.RemoveFromPlaylist(r.Context(), c.user.ID, pathID(r), normalizeAll(entries)))
 	}))
 	rt.handle(http.MethodPost, "/Playlists/{id}/Items/{entryId}/Move/{index}", a(func(w http.ResponseWriter, r *http.Request, c *caller) {
 		idx, err := parseIndex(r.PathValue("index"))
@@ -62,7 +66,7 @@ func (s *Server) listRoutes(rt *router) {
 			http.Error(w, "bad index", http.StatusBadRequest)
 			return
 		}
-		s.listResult(w, r, s.ud.MovePlaylistEntry(r.Context(), c.user.ID, r.PathValue("id"), identity.NormalizeID(r.PathValue("entryId")), idx))
+		s.listResult(w, r, s.ud.MovePlaylistEntry(r.Context(), c.user.ID, pathID(r), identity.NormalizeID(r.PathValue("entryId")), idx))
 	}))
 
 	rt.handle(http.MethodPost, "/Collections", a(func(w http.ResponseWriter, r *http.Request, c *caller) {
@@ -79,15 +83,26 @@ func (s *Server) listRoutes(rt *router) {
 		}
 		writeJSON(w, map[string]string{"Id": col.ID})
 	}))
+	// Upstream collections are edited in JellyBloom only: additions and
+	// removals are kept here and applied over the upstream's members.
 	rt.handle(http.MethodPost, "/Collections/{id}/Items", a(func(w http.ResponseWriter, r *http.Request, c *caller) {
-		if _, err := s.ud.Collection(r.Context(), r.PathValue("id")); err != nil {
-			s.listResult(w, r, err)
+		id, ctx := pathID(r), r.Context()
+		if !s.isCollection(ctx, id) {
+			http.NotFound(w, r)
 			return
 		}
-		s.listResult(w, r, s.ud.AddToCollection(r.Context(), r.PathValue("id"), s.knownIDs(readParams(r).list("ids"))))
+		s.listResult(w, r, s.ud.AddToCollection(ctx, id, s.knownIDs(readParams(r).list("ids"))))
 	}))
 	rt.handle(http.MethodDelete, "/Collections/{id}/Items", a(func(w http.ResponseWriter, r *http.Request, c *caller) {
-		s.listResult(w, r, s.ud.RemoveFromCollection(r.Context(), r.PathValue("id"), normalizeAll(readParams(r).list("ids"))))
+		id, ctx, items := pathID(r), r.Context(), normalizeAll(readParams(r).list("ids"))
+		switch {
+		case s.isLocalCollection(ctx, id):
+			s.listResult(w, r, s.ud.RemoveFromCollection(ctx, id, items))
+		case s.catalog.Type(id) == "BoxSet":
+			s.listResult(w, r, s.ud.HideInCollection(ctx, id, items))
+		default:
+			http.NotFound(w, r)
+		}
 	}))
 
 	// Deleting items is otherwise blocked (it would delete upstream media);
@@ -104,6 +119,105 @@ func (s *Server) listRoutes(rt *router) {
 		}
 		s.listResult(w, r, err)
 	}))
+}
+
+// pathID is the {id} path value, normalized.
+func pathID(r *http.Request) string { return identity.NormalizeID(r.PathValue("id")) }
+
+// isLocalList: one of c's playlists or a JellyBloom collection.
+func (s *Server) isLocalList(ctx context.Context, c *caller, id string) bool {
+	_, err := s.ud.Playlist(ctx, c.user.ID, id)
+	return err == nil || s.isLocalCollection(ctx, id)
+}
+
+// withUserData sets the caller's UserData on JellyBloom's own list DTOs.
+func (s *Server) withUserData(ctx context.Context, c *caller, dtos ...map[string]any) {
+	ids := make([]string, len(dtos))
+	for i, d := range dtos {
+		ids[i] = d["Id"].(string)
+	}
+	uds, err := s.catalog.UserDataDTOs(ctx, c.user.ID, ids)
+	if err != nil {
+		return // keep the neutral stub
+	}
+	for i, d := range dtos {
+		d["UserData"] = uds[ids[i]]
+	}
+}
+
+func (s *Server) isLocalCollection(ctx context.Context, id string) bool {
+	_, err := s.ud.Collection(ctx, id)
+	return err == nil
+}
+
+// isCollection: a JellyBloom collection or an upstream one (BoxSet).
+func (s *Server) isCollection(ctx context.Context, id string) bool {
+	return s.isLocalCollection(ctx, id) || s.catalog.Type(id) == "BoxSet"
+}
+
+// collectionMembers lists a JellyBloom or upstream collection's members.
+func (s *Server) collectionMembers(r *http.Request, c *caller, id string) ([]string, error) {
+	if col, err := s.ud.Collection(r.Context(), id); err == nil {
+		return col.Items, nil
+	}
+	return s.boxSetMembers(r, c, id)
+}
+
+// boxSetMembers lists an upstream collection's visible members (merged
+// across the upstreams that have it) with JellyBloom's edits applied.
+// Jellyfin links members rather than nesting them, so they are asked for.
+func (s *Server) boxSetMembers(r *http.Request, c *caller, id string) ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	add := func(u string) {
+		if u != "" && !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	for _, cp := range s.catalog.Copies(id) {
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		ids, err := s.upstreamChildren(ctx, r, c, cp.Upstream, cp.ID)
+		cancel()
+		if err != nil {
+			s.log.Warn("listing an upstream collection", "upstream", cp.Upstream, "err", err)
+			continue
+		}
+		for _, real := range ids {
+			add(s.catalog.Visible(cp.Upstream, real))
+		}
+	}
+	added, hidden, err := s.ud.CollectionEdits(r.Context(), id)
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range added {
+		if s.catalog.Known(a) {
+			add(a)
+		}
+	}
+	return slices.DeleteFunc(out, func(x string) bool { return slices.Contains(hidden, x) }), nil
+}
+
+// upstreamChildren returns the IDs of a folder's children on an upstream.
+func (s *Server) upstreamChildren(ctx context.Context, r *http.Request, c *caller, up, parent string) ([]string, error) {
+	resp, _, err := s.proxy.Call(ctx, r, up, proxyCaller(c), http.MethodGet, "/Items", url.Values{"ParentId": {parent}}, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var body struct{ Items []struct{ Id string } }
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&body); err != nil {
+		return nil, err
+	}
+	ids := make([]string, len(body.Items))
+	for i, it := range body.Items {
+		ids[i] = it.Id
+	}
+	return ids, nil
 }
 
 func normalizeAll(ids []string) []string {
@@ -260,10 +374,14 @@ func (s *Server) addLocalViews(ctx context.Context, c *caller, res *catalog.Quer
 // library, or nil.
 func (s *Server) localItem(ctx context.Context, c *caller, id string) map[string]any {
 	if p, err := s.ud.Playlist(ctx, c.user.ID, id); err == nil {
-		return s.playlistDTO(p)
+		d := s.playlistDTO(p)
+		s.withUserData(ctx, c, d)
+		return d
 	}
 	if col, err := s.ud.Collection(ctx, id); err == nil {
-		return s.collectionDTO(col)
+		d := s.collectionDTO(col)
+		s.withUserData(ctx, c, d)
+		return d
 	}
 	switch id {
 	case playlistsViewID:
@@ -288,13 +406,18 @@ func (s *Server) localItems(w http.ResponseWriter, r *http.Request, c *caller, q
 			s.writePlaylistItems(w, r, c, pl)
 			return true
 		}
-		if col, err := s.ud.Collection(ctx, parent); err == nil {
-			cq := q
-			cq.ParentID, cq.IDs = "", col.Items
-			if len(cq.IDs) == 0 {
+		if s.isCollection(ctx, parent) {
+			members, err := s.collectionMembers(r, c, parent)
+			if err != nil {
+				s.internal(w, err)
+				return true
+			}
+			if len(members) == 0 {
 				writeJSON(w, emptyResult())
 				return true
 			}
+			cq := q
+			cq.ParentID, cq.IDs = "", members
 			res, err := s.catalog.Query(ctx, cq, p.listOptions(c))
 			s.writeResult(w, res, err)
 			return true
@@ -316,6 +439,7 @@ func (s *Server) localItems(w http.ResponseWriter, r *http.Request, c *caller, q
 		for _, pl := range pls {
 			items = append(items, s.playlistDTO(pl))
 		}
+		s.withUserData(ctx, c, items...)
 	} else {
 		cols, err := s.ud.Collections(ctx)
 		if err != nil {
@@ -325,6 +449,7 @@ func (s *Server) localItems(w http.ResponseWriter, r *http.Request, c *caller, q
 		for _, col := range cols {
 			items = append(items, s.collectionDTO(col))
 		}
+		s.withUserData(ctx, c, items...)
 		// Upstream collections (BoxSets) in the same library come along.
 		uq := q
 		uq.StartIndex, uq.Limit = 0, 0
@@ -373,6 +498,26 @@ func (s *Server) writePlaylistItems(w http.ResponseWriter, r *http.Request, c *c
 	for _, e := range pl.Entries {
 		if s.catalog.Known(e.ItemID) {
 			entries = append(entries, e)
+		}
+	}
+	if by := p.list("sortBy"); len(by) > 0 {
+		if slices.ContainsFunc(by, func(k string) bool { return strings.EqualFold(k, "Random") }) {
+			rand.Shuffle(len(entries), func(i, j int) { entries[i], entries[j] = entries[j], entries[i] })
+		} else {
+			ids := make([]string, len(entries))
+			for i, e := range entries {
+				ids[i] = e.ItemID
+			}
+			order, err := s.catalog.Order(r.Context(), ids, by, p.list("sortOrder"), c.user.ID)
+			if err != nil {
+				s.internal(w, err)
+				return
+			}
+			rank := map[string]int{}
+			for i, id := range order {
+				rank[id] = i
+			}
+			slices.SortStableFunc(entries, func(a, b userdata.Entry) int { return cmp.Compare(rank[a.ItemID], rank[b.ItemID]) })
 		}
 	}
 	start, limit := p.int("startIndex", 0), p.int("limit", 0)

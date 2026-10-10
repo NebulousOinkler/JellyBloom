@@ -2,8 +2,10 @@
 """Drives JellyBloom like a Jellyfin client against the local test rig.
 
 Checks login, merged libraries, browsing, details, artwork, PlaybackInfo
-versions, HLS, direct play, and music, and that no upstream IDs, tokens, or
-addresses reach the client. Prints PASS/FAIL per check; exits 1 on failure.
+versions, HLS, direct play, music, audiobooks, upstream collections, and user
+state, and that no upstream IDs, tokens, or addresses reach the client.
+Prints PASS/FAIL per check; exits 1 on failure. testrig/compare.py checks
+user-state behavior against real Jellyfin.
 
 Usage: testrig/smoke.py   (after testrig/servers.sh start)
 """
@@ -93,14 +95,24 @@ def user_state(tok, uid, movie, series, leaks):
         _, _, nu = req(f"/Shows/NextUp?userId={uid}", tok)
         check("next up is episode 2 after watching episode 1", [i.get("IndexNumber") for i in nu["Items"]] == [2], nu)
         _, _, sd = req(f"/Users/{uid}/Items/{series['Id']}", tok)
-        check("series shows 1 unplayed episode", sd["UserData"].get("UnplayedItemCount") == 1, sd["UserData"])
+        n = len(eps["Items"]) - 1
+        check(f"series shows {n} unplayed episodes", sd["UserData"].get("UnplayedItemCount") == n, sd["UserData"])
         req(f"/Users/{uid}/PlayedItems/{series['Id']}", tok, method="POST")  # legacy route, whole series
         _, _, sd = req(f"/Users/{uid}/Items/{series['Id']}", tok)
         check("marking the series played marks every episode", sd["UserData"].get("Played") is True, sd["UserData"])
 
+    for it in req(f"/Users/{uid}/Items?Recursive=true&Filters=IsFavorite", tok)[2]["Items"]:  # start clean
+        req(f"/UserFavoriteItems/{it['Id']}", tok, method="DELETE")
     req(f"/UserFavoriteItems/{mid}", tok, method="POST")
     _, _, favs = req(f"/Users/{uid}/Items?Recursive=true&Filters=IsFavorite", tok)
     check("favorites filter", [i["Id"] for i in favs["Items"]] == [mid], favs)
+
+    if series:
+        ep_ids = [e["Id"] for e in eps["Items"]]
+        st, _, mix = req("/Playlists", tok, method="POST", body={"Name": "Shuffle Mix", "Ids": ep_ids, "UserId": uid})
+        orders = {tuple(i["Id"] for i in req(f"/Users/{uid}/Items?ParentId={mix['Id']}&SortBy=Random", tok)[2]["Items"]) for _ in range(8)}
+        check("shuffling a playlist (SortBy=Random)", len(orders) > 1 and all(sorted(o) == sorted(ep_ids) for o in orders), orders)
+        req(f"/Items/{mix['Id']}", tok, method="DELETE")
 
     st, _, pl = req("/Playlists", tok, method="POST", body={"Name": "Smoke Mix", "Ids": [mid], "UserId": uid})
     pid = pl.get("Id") if isinstance(pl, dict) else None
@@ -114,6 +126,29 @@ def user_state(tok, uid, movie, series, leaks):
         check("delete playlist", st == 204, st)
     st, _, _ = req(f"/Items/{mid}", tok, method="DELETE")
     check("deleting upstream media is refused", st == 403, st)
+
+
+def upstream_collection(tok, uid, library, rig, leaks):
+    """A collection made on server a: members are linked, and edits stay in JellyBloom."""
+    _, _, cols = req(f"/Users/{uid}/Items?ParentId={library['Id']}", tok)
+    col = next((c for c in cols.get("Items", []) if c["Name"] == "Test Pattern Collection"), None)
+    check("upstream collection listed", col is not None and col["Type"] == "BoxSet", cols)
+    if not col:
+        return
+    members = lambda: sorted(i["Name"] for i in req(f"/Users/{uid}/Items?ParentId={col['Id']}", tok)[2]["Items"])
+    check("upstream collection members", members() == ["Colour Bars (1971)", "Long Test Pattern"], members())
+    _, _, night = req(f"/Users/{uid}/Items?Recursive=true&IncludeItemTypes=Movie&SearchTerm=Night", tok)
+    nid = night["Items"][0]["Id"]
+    st, _, _ = req(f"/Collections/{col['Id']}/Items?ids={nid}", tok, method="POST")
+    got = members()
+    req(f"/Collections/{col['Id']}/Items?ids={nid}", tok, method="DELETE")
+    check("adding to an upstream collection", st == 204 and "Night of the Test Pattern" in got, f"{st} {got}")
+    a = rig["upstreams"]["a"]
+    atok = call(a["url"], "POST", "/Users/AuthenticateByName", {"Username": a["username"], "Pw": a["password"]})["AccessToken"]
+    upcol = call(a["url"], "GET", "/Items", token=atok, query={"Recursive": "true", "IncludeItemTypes": "BoxSet"})["Items"][0]
+    upm = sorted(i["Name"] for i in call(a["url"], "GET", "/Items", token=atok, query={"ParentId": upcol["Id"]})["Items"])
+    check("the upstream collection itself is unchanged", upm == ["Colour Bars (1971)", "Long Test Pattern"], upm)
+    no_leaks("upstream collection", cols, leaks)
 
 
 def main():
@@ -130,16 +165,18 @@ def main():
 
     st, _, views = req(f"/UserViews?userId={uid}", tok)
     names = sorted(v["Name"] for v in views["Items"])
-    check("libraries: Movies merged, plus Shows and Music", names == ["Movies", "Music", "Shows"], names)
+    check("libraries: Movies merged, plus Shows, Music, Books, and a's Collections",
+          names == ["Books", "Collections", "Movies", "Music", "Shows"], names)
     no_leaks("libraries", views, leaks)
     lib = {v["Name"]: v for v in views["Items"]}
 
     st, _, movies = req(f"/Users/{uid}/Items?ParentId={lib['Movies']['Id']}&Recursive=true&IncludeItemTypes=Movie"
                         "&SortBy=SortName&Fields=PrimaryImageAspectRatio,ProviderIds", tok)
     mnames = [m["Name"] for m in movies["Items"]]
-    check("movies deduplicated across servers", sorted(mnames) == ["Colour Bars (1971)", "Night of the Test Pattern"], mnames)
+    check("movies deduplicated across servers", sorted(mnames) == ["Colour Bars (1971)", "Long Test Pattern", "Night of the Test Pattern"], mnames)
     no_leaks("movie list", movies, leaks)
     shared = next(m for m in movies["Items"] if m["Name"] == "Night of the Test Pattern")
+    long_movie = next((m for m in movies["Items"] if m["Name"] == "Long Test Pattern"), None)
 
     st, _, top = req(f"/Users/{uid}/Items?ParentId={lib['Movies']['Id']}", tok)
     check("non-recursive library listing", st == 200, st)
@@ -163,14 +200,21 @@ def main():
     check("shows", ser is not None and ser["Name"] == "Test Show", series)
     if ser:
         st, _, eps = req(f"/Shows/{ser['Id']}/Episodes?userId={uid}", tok)
-        check("episodes in order", [e["IndexNumber"] for e in eps["Items"]] == [1, 2], eps)
+        check("episodes in order", [(e["ParentIndexNumber"], e["IndexNumber"]) for e in eps["Items"]] == [(1, 1), (1, 2), (1, 3), (1, 4), (2, 1)],
+              [(e.get("ParentIndexNumber"), e.get("IndexNumber")) for e in eps["Items"]])
 
     st, _, albums = req(f"/Users/{uid}/Items?ParentId={lib['Music']['Id']}&Recursive=true&IncludeItemTypes=MusicAlbum", tok)
-    check("music albums", [a["Name"] for a in albums["Items"]] == ["Pure Tones"], albums)
+    check("music albums", sorted(a["Name"] for a in albums["Items"]) == ["Long Tones", "Pure Tones"], albums)
     st, _, artists = req(f"/Artists/AlbumArtists?parentId={lib['Music']['Id']}&userId={uid}", tok)
     check("album artists", [a["Name"] for a in artists["Items"]] == ["Sine Wave Ensemble"], artists)
-    st, _, tracks = req(f"/Users/{uid}/Items?ParentId={albums['Items'][0]['Id']}&SortBy=IndexNumber", tok)
+    pure = next(a for a in albums["Items"] if a["Name"] == "Pure Tones")
+    st, _, tracks = req(f"/Users/{uid}/Items?ParentId={pure['Id']}&SortBy=IndexNumber", tok)
     check("album tracks", [t["Name"] for t in tracks["Items"]] == ["A440", "C523"], tracks)
+
+    st, _, books = req(f"/Users/{uid}/Items?ParentId={lib['Books']['Id']}&Recursive=true&IncludeItemTypes=AudioBook", tok)
+    check("audiobooks", [b["Name"] for b in books["Items"]] == ["The Long Tone"], books)
+
+    upstream_collection(tok, uid, lib["Collections"], rig, leaks)
 
     st, _, hints = req(f"/Search/Hints?searchTerm=pattern&userId={uid}", tok)
     check("search", any(h["Name"] == "Night of the Test Pattern" for h in hints["SearchHints"]), hints)
@@ -233,7 +277,13 @@ def main():
     st, _, _ = req("/System/Logs", tok)
     check("upstream admin routes blocked", st == 403, st)
 
-    user_state(tok, uid, shared, ser, leaks)
+    if long_movie:
+        st, _, lp = req(f"/Items/{long_movie['Id']}/PlaybackInfo?userId={uid}", tok, method="POST", body={"UserId": uid})
+        check("identical copies on both servers are one version", st == 200 and len(lp.get("MediaSources", [])) == 1,
+              [(s.get("Name"), s.get("Id")) for s in lp.get("MediaSources", [])] if isinstance(lp, dict) else lp)
+
+    # Resume needs an item of 5 minutes or more (Jellyfin's MinResumeDurationSeconds).
+    user_state(tok, uid, long_movie or shared, ser, leaks)
 
     print(f"\n{len(failures)} failure(s)" if failures else "\nall checks passed")
     return 1 if failures else 0

@@ -112,7 +112,8 @@ func (f *fakeSource) Items(ctx context.Context, q upstream.ItemsQuery) (*upstrea
 		return nil, errors.New("sync must request full fields")
 	}
 	var ids []string
-	if q.ParentID != "" {
+	// Like Jellyfin 12.2, ParentId is ignored when Ids is given.
+	if q.ParentID != "" && q.IDs == nil {
 		ids = slices.Clone(f.members[q.ParentID])
 	} else {
 		for id := range f.items {
@@ -124,6 +125,19 @@ func (f *fakeSource) Items(ctx context.Context, q upstream.ItemsQuery) (*upstrea
 		ids = slices.DeleteFunc(ids, func(id string) bool { return !slices.Contains(q.IDs, id) })
 	}
 	return f.page(ids, q), nil
+}
+
+// Ancestors reports an item's libraries, as Jellyfin does.
+func (f *fakeSource) Ancestors(ctx context.Context, id string) ([]json.RawMessage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []map[string]any
+	for v, ids := range f.members {
+		if slices.Contains(ids, id) || slices.Contains(f.artists[v], id) {
+			out = append(out, map[string]any{"Id": v, "Type": "CollectionFolder"})
+		}
+	}
+	return raws(out), nil
 }
 
 func (f *fakeSource) page(ids []string, q upstream.ItemsQuery) *upstream.QueryResult {
@@ -371,7 +385,10 @@ func TestIncrementalSync(t *testing.T) {
 		gone, _ := s.Item(ctx, "up", "m5")
 		return it != nil && gone == nil
 	})
-	if it, _ := s.Item(ctx, "up", "m2"); it.Name != "Updated" {
+	if it, _ := s.Item(ctx, "up", "m10"); !slices.Equal(it.Views, []string{"vMovies"}) {
+		t.Errorf("added m10 views = %v, want only its own library", it.Views)
+	}
+	if it, _ := s.Item(ctx, "up", "m2"); it.Name != "Updated" || !slices.Equal(it.Views, []string{"vMovies"}) {
 		t.Errorf("m2 = %q", it.Name)
 	}
 	if it, _ := s.Item(ctx, "up", "m3"); !slices.Equal(it.Views, []string{"vKids"}) {
@@ -405,6 +422,15 @@ func TestReconnectAndNewLibraryTriggerFullSync(t *testing.T) {
 		views, _ := s.Views(ctx, "up")
 		it, _ := s.Item(ctx, "up", "d1")
 		return len(views) == 3 && it != nil
+	})
+
+	// Jellyfin 12.2 reports only a new library's items, not the library.
+	f.addView("vBooks", "Books", "books")
+	f.addItem("vBooks", "b1", "AudioBook", "Book")
+	changed(f, upstream.LibraryChange{ItemsAdded: []string{"b1"}})
+	eventually(t, "resync after a new library's items", func() bool {
+		it, _ := s.Item(ctx, "up", "b1")
+		return it != nil && slices.Equal(it.Views, []string{"vBooks"})
 	})
 }
 

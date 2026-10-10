@@ -58,7 +58,10 @@ a `user`, because item queries need a user context.
 SQLite index of every upstream item. It stores the full DTO JSON per `(upstream, realId)`.
 - **Full sync:** pages through `GET /Items?Recursive=true&Fields=…`.
 - **Incremental sync:** listens on the upstream's `/socket` for `LibraryChanged` messages
-  and re-fetches the affected IDs, with a periodic resync as a backstop.
+  and re-fetches the affected IDs, with a periodic resync as a backstop. Jellyfin ignores
+  `ParentId` when `Ids` is given, so each changed item's library comes from
+  `/Items/{id}/Ancestors`; an item in a library the index lacks (a new library), a change
+  to a library itself, or a burst of more than 200 items triggers a full sync instead.
 - List, search, latest, resume, and next-up queries run as SQL over the merged index, so
   sort, filter, `StartIndex`/`Limit`, and `TotalRecordCount` are exact.
 
@@ -226,12 +229,22 @@ injected plugin scripts and config pages.
 
 JellyBloom owns each user's watch state, keyed by unified item ID, so it is the same
 whichever upstream serves an item:
-- played, play count, favorite, likes, resume position, last played; Jellyfin's resume rules
-  (under 5% not resumable, over 90% played, items under 5 minutes played on stop)
-- folders are played when all their playable items are; marking one marks its items
+- played, play count, favorite, likes, resume position, last played, following Jellyfin
+  12.2 exactly (checked with `testrig/compare.py`): progress and stop reports apply the
+  resume rules (under 5% no resume point, over 90% played, items under 5 minutes played);
+  audiobooks use 5-minute rules instead; music is played when it starts and never keeps a
+  resume point; a start counts a play but leaves the position alone; marking unplayed
+  clears play count and date; a played item with a resume point (a rewatch) is resumable
+- folders are played when all their playable items are; marking one marks its items, and
+  marking a collection or playlist marks its members
+- Next Up continues after the furthest played episode of each series being watched, and
+  honors `enableResumable`, `enableRewatching`, and `nextUpDateCutoff`
 - playback reports update local state and are forwarded upstream (transcode cleanup)
 - Resume, Next Up, favorites, and played filters/sorts read local state
-- playlists (private, ordered) and collections (shared) hold unified IDs
+- playlists (private, ordered; `SortBy` reorders, `Random` shuffles) and collections
+  (shared) hold unified IDs. Upstream collections (BoxSets) link their members, so members
+  are asked of the upstreams when browsed; edits to them are kept in JellyBloom on top of
+  the upstream's members and never sent upstream
 - when items merge (identity redirect), their user data and list entries move to the new ID
 
 ## Upstream credentials

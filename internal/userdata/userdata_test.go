@@ -32,45 +32,96 @@ func open(t *testing.T) *Store {
 
 func ticks(sec int64) *int64 { v := sec * 10_000_000; return &v }
 
-func TestApplyResumeRules(t *testing.T) {
-	now := time.Now()
-	movie := int64(7200) * 10_000_000 // 2h
-	short := int64(120) * 10_000_000  // 2min
+// The expectations below were observed on a real Jellyfin 12.2 server with
+// testrig (same steps, compared field by field).
+func TestApplyMatchesJellyfin(t *testing.T) {
+	t0 := time.UnixMilli(1_000_000)
+	movie := Item{Runtime: 600 * 10_000_000, Kind: KindVideo}
+	short := Item{Runtime: 20 * 10_000_000, Kind: KindVideo}
+	track := Item{Runtime: 360 * 10_000_000, Kind: KindAudio}
+	book := Item{Runtime: 720 * 10_000_000, Kind: KindAudioBook}
+	start := func(pos *int64) Report { return Report{Event: Start, PositionTicks: pos} }
+	progress := func(pos *int64) Report { return Report{Event: Progress, PositionTicks: pos} }
+	stop := func(pos *int64) Report { return Report{Event: Stop, PositionTicks: pos} }
+	type want struct {
+		played bool
+		count  int
+		pos    int64 // seconds
+		dated  bool  // LastPlayed moved to this step's time
+	}
 	cases := []struct {
-		name       string
-		runtime    int64
-		stopAt     *int64
-		wantPos    int64
-		wantPlayed bool
+		name  string
+		item  Item
+		steps []Report
+		want  []want
 	}{
-		{"middle of a movie: resumable", movie, ticks(3600), 3600 * 10_000_000, false},
-		{"under 5%: not resumable", movie, ticks(60), 0, false},
-		{"over 90%: played", movie, ticks(7000), 0, true},
-		{"short item: played on stop", short, ticks(60), 0, true},
-		{"unknown runtime: played on stop", 0, ticks(60), 0, true},
-		{"no position reported: unchanged", movie, nil, 42, false},
+		{"movie: watch, rewatch, finish", movie,
+			[]Report{start(ticks(300)), progress(ticks(18)), progress(ticks(300)), stop(ticks(300)), start(nil), progress(ticks(570)), stop(ticks(570)), start(ticks(0)), stop(ticks(12))},
+			[]want{{false, 1, 0, true}, {false, 1, 0, false}, {false, 1, 300, true}, {false, 1, 300, true}, {false, 2, 300, true},
+				{true, 2, 0, true}, {true, 2, 0, true}, {true, 3, 0, false}, {true, 3, 0, false}}},
+		{"movie: stop without position", movie, []Report{stop(nil)}, []want{{true, 1, 0, true}}},
+		{"short video: a resume point counts as played", short, []Report{start(ticks(0)), progress(ticks(10))}, []want{{false, 1, 0, true}, {true, 1, 0, true}}},
+		{"music: played on start, never resumable", track,
+			[]Report{start(ticks(0)), progress(ticks(180)), stop(ticks(180))}, []want{{true, 1, 0, true}, {true, 1, 0, false}, {true, 1, 0, false}}},
+		{"audiobook: minute rules", book,
+			[]Report{start(ticks(0)), progress(ticks(120)), progress(ticks(360)), stop(ticks(360)), start(nil), stop(ticks(600))},
+			[]want{{false, 1, 0, true}, {false, 1, 0, false}, {false, 1, 360, true}, {false, 1, 360, true}, {false, 2, 360, true}, {true, 2, 0, true}}},
+		{"audiobook: stop early, then without position", book, []Report{stop(ticks(29)), stop(nil)}, []want{{false, 0, 0, false}, {true, 1, 0, true}}},
+		{"unknown runtime: played", Item{}, []Report{stop(ticks(5))}, []want{{true, 0, 0, true}}},
 	}
 	for _, c := range cases {
-		r := Record{Position: 42}
-		Apply(&r, Report{Event: Stop, PositionTicks: c.stopAt}, c.runtime, now)
-		if r.Position != c.wantPos || r.Played != c.wantPlayed || !r.LastPlayed.Equal(now) {
-			t.Errorf("%s: pos=%d played=%v", c.name, r.Position, r.Played)
+		var r Record
+		for i, rep := range c.steps {
+			now := t0.Add(time.Duration(i+1) * time.Minute)
+			Apply(&r, rep, c.item, now)
+			w := c.want[i]
+			if r.Played != w.played || r.PlayCount != w.count || r.Position != w.pos*10_000_000 || r.LastPlayed.Equal(now) != w.dated {
+				t.Errorf("%s, step %d: played=%v count=%d pos=%ds dated=%v; want %+v",
+					c.name, i+1, r.Played, r.PlayCount, r.Position/10_000_000, r.LastPlayed.Equal(now), w)
+			}
 		}
 	}
 
 	r := Record{}
 	a, sub := 2, 3
-	Apply(&r, Report{Event: Start, AudioStream: &a}, movie, now)
-	Apply(&r, Report{Event: Progress, PositionTicks: ticks(100), SubtitleStream: &sub}, movie, now)
-	if r.PlayCount != 1 || r.Position != 100*10_000_000 || *r.AudioStream != 2 || *r.SubtitleStream != 3 || !r.Resumable() {
-		t.Errorf("start+progress = %+v", r)
+	Apply(&r, Report{Event: Start, AudioStream: &a}, movie, t0)
+	Apply(&r, Report{Event: Progress, SubtitleStream: &sub}, movie, t0)
+	if *r.AudioStream != 2 || *r.SubtitleStream != 3 {
+		t.Errorf("stream choices = %+v", r)
+	}
+	r = Record{Played: true, Position: 5}
+	if !r.Resumable() {
+		t.Error("a played item with a resume point (a rewatch) is resumable, as in Jellyfin")
+	}
+}
+
+func TestMarkPlayedMatchesJellyfin(t *testing.T) {
+	now, then := time.UnixMilli(5000), time.UnixMilli(1000)
+	var r Record
+	MarkPlayed(&r, nil, now)
+	if !r.Played || r.PlayCount != 1 || !r.LastPlayed.Equal(now) {
+		t.Errorf("first mark = %+v", r)
+	}
+	MarkPlayed(&r, nil, now.Add(time.Hour))
+	if r.PlayCount != 1 || !r.LastPlayed.Equal(now) {
+		t.Errorf("marking again without a date keeps count and date: %+v", r)
+	}
+	MarkPlayed(&r, &then, now)
+	if r.PlayCount != 2 || !r.LastPlayed.Equal(then) {
+		t.Errorf("marking with a date counts a play on that date: %+v", r)
+	}
+	r.Position = 7
+	MarkUnplayed(&r)
+	if r != (Record{}) {
+		t.Errorf("unplayed clears everything Jellyfin clears: %+v", r)
 	}
 }
 
 func TestStore(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)
-	recs, err := s.Update(ctx, "u1", []string{"a", "b"}, func(r *Record) { MarkPlayed(r, time.UnixMilli(1000)) })
+	at := time.UnixMilli(1000)
+	recs, err := s.Update(ctx, "u1", []string{"a", "b"}, func(r *Record) { MarkPlayed(r, &at, at) })
 	if err != nil || !recs["a"].Played || recs["b"].PlayCount != 1 {
 		t.Fatalf("Update = %+v, %v", recs, err)
 	}
