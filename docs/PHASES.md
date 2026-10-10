@@ -47,15 +47,24 @@ with the "done when" check from that table. Target upstream version: Jellyfin 10
   any child is, so `difference` never hides an a-only episode behind a shared series.
 
 ## Phase 4: Server skeleton and generic routing (`internal/server`, `internal/rewrite`)
-- [ ] Case-insensitive router
-- [ ] Token extraction from all four places clients send it
-- [ ] JellyBloom users: `AuthenticateByName`, `/Users/Me`, QuickConnect stub
-- [ ] `/System/Info`, `/System/Info/Public`, branding, display preferences, stable `ServerId`
-- [ ] Client `/socket`: KeepAlive, plus `LibraryChanged` and `UserDataChanged` broadcasts
-- [ ] Rewriter: GUID ↔ unified in text bodies, upstream URL and token stripping, lazy mapping
-- [ ] Generic fallback router: extract IDs, pick the active source or primary upstream, forward, rewrite
-- [ ] `/web/*` proxy to `web_upstream`
-- [ ] Unhandled-route log
+- [x] Case-insensitive router
+- [x] Token extraction from all four places clients send it
+- [x] JellyBloom users: `AuthenticateByName`, `/Users/Me`, QuickConnect stub
+- [x] `/System/Info`, `/System/Info/Public`, branding, display preferences, stable `ServerId`
+- [x] Client `/socket`: KeepAlive, plus `LibraryChanged` and `UserDataChanged` broadcasts
+- [x] Rewriter: GUID ↔ unified in text bodies, upstream URL and token stripping, lazy mapping
+- [x] Generic fallback router: extract IDs, pick the active source or primary upstream, forward, rewrite
+- [x] `/web/*` proxy to `web_upstream`
+- [x] Unhandled-route log
+- [x] `jellybloom hash-password`; `users` and `fallback_write_allow` config
+- Fallback safety: JellyBloom forwards with its own upstream credentials, so admin/system
+  routes are always 403, writes need an allowlist entry (built-ins cover playback and user
+  data), and only images/localization are anonymous.
+- Users are never reported as administrators, so jellyfin-web hides the dashboard.
+- Known gap (phase 6): every client reaches an upstream as the single JellyBloom device,
+  so concurrent transcodes from different clients on one upstream may collide.
+- Browse endpoints (`/UserViews`, `/Items`) currently fall back to the primary upstream
+  only; phase 5 replaces them with merged answers from the index.
 
 ## Phase 5: Browse, union only (`internal/api`)
 - [ ] `/UserViews` synthesized by `CollectionType`

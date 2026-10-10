@@ -23,3 +23,15 @@ upstreams:
     url: https://jellyfin.example.com
     api_key: 0123456789abcdef
     user: guest   # required with api_key
+
+# JellyBloom's own accounts. Clients log in here; upstream credentials stay private.
+# Generate a hash with: jellybloom hash-password
+users:
+  - name: me
+    password_hash: "$2a$10$replace.with.output.of.hash-password"
+    admin: true
+
+# Extra non-GET routes (regex on the lowercased path) the generic fallback may forward,
+# e.g. for plugin endpoints. Admin/system routes are always blocked.
+# fallback_write_allow:
+#   - "^/introskipper/"

@@ -21,6 +21,7 @@ func TestLoadDefaults(t *testing.T) {
 upstreams:
   - {name: home, url: "http://h:8096", username: me, password: pw}
   - {name: friend, url: "https://f", api_key: k, user: guest}
+users: [{name: me, password_hash: "$2a$10$abcdefghijklmnopqrstuv"}]
 `)
 	if err != nil {
 		t.Fatal(err)
@@ -38,6 +39,7 @@ subtract: [friend]
 upstreams:
   - {name: home, url: "http://h:8096", username: me, password: pw}
   - {name: friend, url: "https://f", api_key: k, user: guest}
+users: [{name: me, password_hash: "$2a$10$abcdefghijklmnopqrstuv"}]
 `)
 	if err != nil {
 		t.Fatal(err)
@@ -61,9 +63,16 @@ func TestLoadErrors(t *testing.T) {
 		"subtract \"z\" is not":   "merge: difference\nbase: a\nsubtract: [z]\nupstreams: [{name: a, url: u, api_key: k, user: x}]",
 		"both base and subtract":  "merge: difference\nbase: a\nsubtract: [a]\nupstreams: [{name: a, url: u, api_key: k, user: x}]",
 		"only apply to":           "base: a\nupstreams: [{name: a, url: u, api_key: k, user: x}]",
+		"at least one user":       "upstreams: [{name: a, url: u, api_key: k, user: x}]\nusers: []",
+		"duplicate user":          "upstreams: [{name: a, url: u, api_key: k, user: x}]\nusers: [{name: Me, password_hash: $2a$x}, {name: me, password_hash: $2a$y}]",
+		"must be a bcrypt":        "upstreams: [{name: a, url: u, api_key: k, user: x}]\nusers: [{name: me, password_hash: plain}]",
+		"fallback_write_allow":    "upstreams: [{name: a, url: u, api_key: k, user: x}]\nfallback_write_allow: [\"(\"]",
 	}
 	for want, yaml := range cases {
 		t.Run(want, func(t *testing.T) {
+			if !strings.Contains(yaml, "users:") {
+				yaml += "\nusers: [{name: me, password_hash: \"$2a$10$abcdefghijklmnopqrstuv\"}]"
+			}
 			_, err := load(t, yaml)
 			if err == nil || !strings.Contains(err.Error(), want) {
 				t.Errorf("err = %v, want containing %q", err, want)

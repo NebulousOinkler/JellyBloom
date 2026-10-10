@@ -118,6 +118,30 @@ func (c *Client) UserID() string {
 	return c.userID
 }
 
+// BaseURL returns a copy of the upstream's base URL (no trailing slash).
+func (c *Client) BaseURL() *url.URL {
+	u := *c.base
+	return &u
+}
+
+// AuthHeader returns the MediaBrowser authorization header for token.
+func (c *Client) AuthHeader(token string) string { return c.authHeader(token) }
+
+// Session returns the current token and user ID, logging in if needed.
+func (c *Client) Session(ctx context.Context) (token, userID string, err error) {
+	if err := c.ensureLogin(ctx, ""); err != nil {
+		return "", "", err
+	}
+	token, userID = c.session()
+	return token, userID, nil
+}
+
+// Reauth discards stale (if it is still current) and logs in again. Use it
+// after the upstream rejects a token with 401.
+func (c *Client) Reauth(ctx context.Context, stale string) error {
+	return c.ensureLogin(ctx, stale)
+}
+
 func (c *Client) session() (token, userID string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

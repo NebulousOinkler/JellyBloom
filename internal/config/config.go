@@ -4,6 +4,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -17,6 +19,13 @@ type Upstream struct {
 	User     string `yaml:"user"` // user to act as when using APIKey
 }
 
+// User is a JellyBloom account. Clients log in to JellyBloom, never to upstreams.
+type User struct {
+	Name         string `yaml:"name"`
+	PasswordHash string `yaml:"password_hash"` // bcrypt; generate with `jellybloom hash-password`
+	Admin        bool   `yaml:"admin"`
+}
+
 type Config struct {
 	Listen      string     `yaml:"listen"`
 	ServerName  string     `yaml:"server_name"`
@@ -26,6 +35,11 @@ type Config struct {
 	WebUpstream string     `yaml:"web_upstream"`
 	DataDir     string     `yaml:"data_dir"`
 	Upstreams   []Upstream `yaml:"upstreams"`
+	Users       []User     `yaml:"users"`
+	// FallbackWriteAllow lists extra regexes (matched against the lowercased
+	// path) for non-GET requests the generic fallback may forward, e.g. for
+	// plugin endpoints. Built-in rules cover playback and user data.
+	FallbackWriteAllow []string `yaml:"fallback_write_allow"`
 }
 
 func Load(path string) (*Config, error) {
@@ -78,6 +92,27 @@ func Load(path string) (*Config, error) {
 		}
 	} else if c.Base != "" || len(c.Subtract) > 0 {
 		return nil, fmt.Errorf("base and subtract only apply to merge: difference")
+	}
+	if len(c.Users) == 0 {
+		return nil, fmt.Errorf("at least one user is required")
+	}
+	users := map[string]bool{}
+	for i, u := range c.Users {
+		if u.Name == "" {
+			return nil, fmt.Errorf("user %d: name is required", i)
+		}
+		if users[strings.ToLower(u.Name)] {
+			return nil, fmt.Errorf("duplicate user %q", u.Name)
+		}
+		users[strings.ToLower(u.Name)] = true
+		if !strings.HasPrefix(u.PasswordHash, "$2") {
+			return nil, fmt.Errorf("user %q: password_hash must be a bcrypt hash (see `jellybloom hash-password`)", u.Name)
+		}
+	}
+	for _, re := range c.FallbackWriteAllow {
+		if _, err := regexp.Compile(re); err != nil {
+			return nil, fmt.Errorf("fallback_write_allow: %w", err)
+		}
 	}
 	if c.WebUpstream == "" {
 		c.WebUpstream = c.Upstreams[0].Name
