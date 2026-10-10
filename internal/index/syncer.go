@@ -251,16 +251,7 @@ func (s *Syncer) FullSync(ctx context.Context) (err error) {
 	// Folders whose parent is not indexed are library root folders.
 	seen := map[string]bool{}
 	folders := map[string]string{} // folder -> parent
-	defer func() {
-		if err == nil {
-			for f, parent := range folders {
-				if !seen[parent] {
-					roots[f] = true
-				}
-			}
-			s.roots.Store(&roots)
-		}
-	}()
+
 
 	items := 0
 	for _, v := range headers {
@@ -294,6 +285,14 @@ func (s *Syncer) FullSync(ctx context.Context) (err error) {
 			}
 		}
 	}
+	// Record library roots before the commit makes this sync visible, so a
+	// scan-finished message arriving right after it is recognized.
+	for f, parent := range folders {
+		if !seen[parent] {
+			roots[f] = true
+		}
+	}
+	s.roots.Store(&roots)
 	if err := fs.Commit(ctx); err != nil {
 		return err
 	}

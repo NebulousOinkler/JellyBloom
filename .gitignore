@@ -4,3 +4,4 @@ config.yaml
 .DS_Store
 /data/
 /testrig/data/
+__pycache__/

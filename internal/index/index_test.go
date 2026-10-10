@@ -444,7 +444,12 @@ func TestLibraryScanFinishTriggersFullSync(t *testing.T) {
 		t.Fatalf("resynced on a non-final or non-library progress message (generation %d)", st.Generation)
 	}
 	msg("vMovies", "100")
-	eventually(t, "resync after scan", func() bool { it, _ := s.Item(ctx, "up", "m6"); return it != nil && it.Name == "New artwork, same item" })
+	// Staged rows are readable before a sync commits, so wait for the commit.
+	eventually(t, "resync after scan", func() bool {
+		st, _ := s.Status(ctx, "up")
+		it, _ := s.Item(ctx, "up", "m6")
+		return st.Generation >= 2 && it != nil && it.Name == "New artwork, same item"
+	})
 
 	// Jellyfin reports completion for a library's physical root folder, a
 	// Folder whose parent is not indexed.
@@ -452,8 +457,11 @@ func TestLibraryScanFinishTriggersFullSync(t *testing.T) {
 	f.mu.Lock()
 	f.items["rootfolder"]["ParentId"] = "aggregate-root"
 	f.mu.Unlock()
+	before, _ := s.Status(ctx, "up")
 	f.emit(upstream.Event{Upstream: "up", Type: upstream.EventConnected}) // reconnect -> resync learns the root
-	eventually(t, "root folder indexed", func() bool { it, _ := s.Item(ctx, "up", "rootfolder"); return it != nil })
+	// Roots are recorded when the sync commits, so wait for the commit rather
+	// than for the folder to appear.
+	eventually(t, "resync committed", func() bool { st, _ := s.Status(ctx, "up"); return st.Generation > before.Generation })
 	f.rename("m5", "Changed during scan")
 	msg("rootfolder", "100")
 	eventually(t, "resync after root folder scan", func() bool { it, _ := s.Item(ctx, "up", "m5"); return it != nil && it.Name == "Changed during scan" })
