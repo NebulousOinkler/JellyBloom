@@ -69,6 +69,53 @@ def no_leaks(name, payload, leaks):
     check(f"{name}: no upstream IDs/addresses", not found, f"leaked {found[:3]}")
 
 
+def user_state(tok, uid, movie, series, leaks):
+    """Phase 7: watched state, resume, next up, favorites, playlists."""
+    mid = movie["Id"]
+    for path in (f"/UserPlayedItems/{mid}", f"/UserFavoriteItems/{mid}"):  # start clean
+        req(path, tok, method="DELETE")
+    req(f"/Sessions/Playing", tok, method="POST", body={"ItemId": mid, "PositionTicks": 0})
+    runtime = movie.get("RunTimeTicks") or req(f"/Users/{uid}/Items/{mid}", tok)[2].get("RunTimeTicks", 0)
+    req(f"/Sessions/Playing/Progress", tok, method="POST", body={"ItemId": mid, "PositionTicks": runtime // 2})
+    st, _, res = req(f"/Users/{uid}/Items/Resume?MediaTypes=Video", tok)
+    check("resume after stopping half way", any(i["Id"] == mid for i in res.get("Items", [])), res)
+    req(f"/Sessions/Playing/Stopped", tok, method="POST", body={"ItemId": mid, "PositionTicks": runtime * 95 // 100})
+    _, _, d = req(f"/Users/{uid}/Items/{mid}", tok)
+    check("watched after stopping at 95%", d["UserData"]["Played"] is True and d["UserData"]["PlaybackPositionTicks"] == 0, d["UserData"])
+    no_leaks("item with user data", d, leaks)
+
+    if series:
+        _, _, eps = req(f"/Shows/{series['Id']}/Episodes?userId={uid}", tok)
+        e1 = eps["Items"][0]["Id"]
+        for e in eps["Items"]:
+            req(f"/UserPlayedItems/{e['Id']}", tok, method="DELETE")
+        req(f"/UserPlayedItems/{e1}", tok, method="POST")
+        _, _, nu = req(f"/Shows/NextUp?userId={uid}", tok)
+        check("next up is episode 2 after watching episode 1", [i.get("IndexNumber") for i in nu["Items"]] == [2], nu)
+        _, _, sd = req(f"/Users/{uid}/Items/{series['Id']}", tok)
+        check("series shows 1 unplayed episode", sd["UserData"].get("UnplayedItemCount") == 1, sd["UserData"])
+        req(f"/Users/{uid}/PlayedItems/{series['Id']}", tok, method="POST")  # legacy route, whole series
+        _, _, sd = req(f"/Users/{uid}/Items/{series['Id']}", tok)
+        check("marking the series played marks every episode", sd["UserData"].get("Played") is True, sd["UserData"])
+
+    req(f"/UserFavoriteItems/{mid}", tok, method="POST")
+    _, _, favs = req(f"/Users/{uid}/Items?Recursive=true&Filters=IsFavorite", tok)
+    check("favorites filter", [i["Id"] for i in favs["Items"]] == [mid], favs)
+
+    st, _, pl = req("/Playlists", tok, method="POST", body={"Name": "Smoke Mix", "Ids": [mid], "UserId": uid})
+    pid = pl.get("Id") if isinstance(pl, dict) else None
+    check("create playlist", st == 200 and pid, pl)
+    if pid:
+        _, _, items = req(f"/Playlists/{pid}/Items?userId={uid}", tok)
+        check("playlist lists its item", [i["Id"] for i in items["Items"]] == [mid] and items["Items"][0].get("PlaylistItemId"), items)
+        _, _, views = req(f"/UserViews?userId={uid}", tok)
+        check("Playlists library appears", any(v.get("CollectionType") == "playlists" for v in views["Items"]), views)
+        st, _, _ = req(f"/Items/{pid}", tok, method="DELETE")
+        check("delete playlist", st == 204, st)
+    st, _, _ = req(f"/Items/{mid}", tok, method="DELETE")
+    check("deleting upstream media is refused", st == 403, st)
+
+
 def main():
     rig = load_rig()
     leaks = upstream_secrets(rig)
@@ -185,6 +232,8 @@ def main():
 
     st, _, _ = req("/System/Logs", tok)
     check("upstream admin routes blocked", st == 403, st)
+
+    user_state(tok, uid, shared, ser, leaks)
 
     print(f"\n{len(failures)} failure(s)" if failures else "\nall checks passed")
     return 1 if failures else 0

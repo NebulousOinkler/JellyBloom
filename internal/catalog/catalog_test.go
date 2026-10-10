@@ -6,9 +6,11 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/NebulousOinkler/JellyBloom/internal/identity"
 	"github.com/NebulousOinkler/JellyBloom/internal/index"
+	"github.com/NebulousOinkler/JellyBloom/internal/userdata"
 )
 
 type dto = map[string]any
@@ -45,6 +47,7 @@ type fixture struct {
 	idx *index.Store
 	res *identity.Resolver
 	cat *Catalog
+	ud  *userdata.Store
 }
 
 func put(t testing.TB, idx *index.Store, up string, views []dto, byView map[string][]dto) {
@@ -123,7 +126,11 @@ func newFixture(t *testing.T, mode identity.Mode) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cat := New(Options{DB: idx.DB(), Resolver: res, Upstreams: []string{"a", "b"}, ServerID: "jbserver",
+	ud, err := userdata.Open(idx.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat := New(Options{DB: idx.DB(), Resolver: res, Upstreams: []string{"a", "b"}, ServerID: "jbserver", UserData: ud,
 		UpstreamIDs: func(_ context.Context, up string) (string, string) {
 			if up == "a" {
 				return userA, serverA
@@ -138,7 +145,7 @@ func newFixture(t *testing.T, mode identity.Mode) *fixture {
 	if _, err := res.Rebuild(ctx); err != nil {
 		t.Fatal(err)
 	}
-	return &fixture{t: t, idx: idx, res: res, cat: cat}
+	return &fixture{t: t, idx: idx, res: res, cat: cat, ud: ud}
 }
 
 func (f *fixture) uid(up, real string) string {
@@ -320,15 +327,15 @@ func TestFieldsTrimming(t *testing.T) {
 func TestLatest(t *testing.T) {
 	f := newFixture(t, identity.Mode{})
 	ctx := context.Background()
-	got, _ := f.cat.Latest(ctx, f.viewID("Movies"), nil, true, 10, DTOOptions{})
+	got, _ := f.cat.Latest(ctx, f.viewID("Movies"), nil, true, false, 10, DTOOptions{})
 	if n := names(got); !slices.Equal(n, []string{"Brazil", "Alien"}) {
 		t.Errorf("latest movies = %v", n)
 	}
-	got, _ = f.cat.Latest(ctx, f.viewID("Shows"), nil, true, 10, DTOOptions{})
+	got, _ = f.cat.Latest(ctx, f.viewID("Shows"), nil, true, false, 10, DTOOptions{})
 	if n := names(got); !slices.Equal(n, []string{"Show"}) {
 		t.Errorf("latest shows (grouped) = %v", n)
 	}
-	got, _ = f.cat.Latest(ctx, f.viewID("Shows"), nil, false, 10, DTOOptions{})
+	got, _ = f.cat.Latest(ctx, f.viewID("Shows"), nil, false, false, 10, DTOOptions{})
 	if n := names(got); !slices.Equal(n, []string{"Two", "One"}) {
 		t.Errorf("latest shows (ungrouped) = %v", n)
 	}
@@ -452,5 +459,121 @@ func TestRootFoldersAreTransparent(t *testing.T) {
 	}
 	if views.Items[0]["ChildCount"] != 1 {
 		t.Errorf("library ChildCount = %v", views.Items[0]["ChildCount"])
+	}
+}
+
+func (f *fixture) set(user, up, real string, fn func(*userdata.Record)) {
+	f.t.Helper()
+	if _, err := f.ud.Update(context.Background(), user, []string{f.uid(up, real)}, fn); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func TestUserDataOverlayAndFilters(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, identity.Mode{})
+	o := DTOOptions{UserID: "u1"}
+	f.set("u1", "a", e1a, func(r *userdata.Record) { userdata.MarkPlayed(r, time.UnixMilli(2000)) })
+	f.set("u1", "a", m1a, func(r *userdata.Record) { r.IsFavorite = true })
+	f.set("u1", "a", m2a, func(r *userdata.Record) { r.Position, r.LastPlayed = 50, time.UnixMilli(3000) })
+	f.set("u2", "a", e2a, func(r *userdata.Record) { userdata.MarkPlayed(r, time.UnixMilli(1)) }) // another user
+
+	series, _ := f.cat.Item(ctx, f.uid("a", sa), o)
+	ud := series["UserData"].(map[string]any)
+	if ud["UnplayedItemCount"] != 1 || ud["Played"] != false || ud["PlayedPercentage"] != 50.0 {
+		t.Errorf("series user data = %v", ud)
+	}
+	ep, _ := f.cat.Item(ctx, f.uid("a", e1a), o)
+	if ud := ep["UserData"].(map[string]any); ud["Played"] != true || ud["PlayCount"] != 1 {
+		t.Errorf("episode user data = %v", ud)
+	}
+	if other, _ := f.cat.Item(ctx, f.uid("a", e2a), o); other["UserData"].(map[string]any)["Played"] != false {
+		t.Error("another user's played state leaked")
+	}
+
+	yes, no := true, false
+	q := func(qq Query) []string {
+		r, err := f.cat.Query(ctx, qq, o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return names(r.Items)
+	}
+	if got := q(Query{Recursive: true, IncludeTypes: []string{"Episode"}, IsPlayed: &yes}); !slices.Equal(got, []string{"One"}) {
+		t.Errorf("isPlayed = %v", got)
+	}
+	if got := q(Query{Recursive: true, IncludeTypes: []string{"Episode"}, Filters: []string{"IsUnplayed"}}); !slices.Equal(got, []string{"Two"}) {
+		t.Errorf("IsUnplayed = %v", got)
+	}
+	if got := q(Query{Recursive: true, IsFavorite: &yes}); !slices.Equal(got, []string{"Alien"}) {
+		t.Errorf("isFavorite = %v", got)
+	}
+	if got := q(Query{Recursive: true, IncludeTypes: []string{"Movie"}, Filters: []string{"IsResumable"}}); !slices.Equal(got, []string{"Brazil"}) {
+		t.Errorf("IsResumable = %v", got)
+	}
+	if got := q(Query{Recursive: true, IncludeTypes: []string{"Series"}, IsPlayed: &no}); !slices.Equal(got, []string{"Show"}) {
+		t.Errorf("series isPlayed=false = %v", got)
+	}
+	got := q(Query{Recursive: true, IncludeTypes: []string{"Movie", "Episode"}, SortBy: []string{"DatePlayed"}, SortOrder: []string{"Descending"}})
+	if got[0] != "Brazil" || got[1] != "One" {
+		t.Errorf("DatePlayed desc = %v", got)
+	}
+
+	// Marking the remaining episode played completes the series.
+	f.set("u1", "a", e2a, func(r *userdata.Record) { userdata.MarkPlayed(r, time.UnixMilli(4000)) })
+	series, _ = f.cat.Item(ctx, f.uid("a", sa), o)
+	if ud := series["UserData"].(map[string]any); ud["Played"] != true || ud["UnplayedItemCount"] != 0 {
+		t.Errorf("completed series = %v", ud)
+	}
+}
+
+func TestResumeNextUpLatest(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, identity.Mode{})
+	o := DTOOptions{UserID: "u1"}
+	series := f.uid("a", sa)
+
+	nu, _ := f.cat.NextUp(ctx, NextUpOptions{}, o)
+	if nu.TotalRecordCount != 0 {
+		t.Errorf("nothing watched: next up = %v", names(nu.Items))
+	}
+	nu, _ = f.cat.NextUp(ctx, NextUpOptions{SeriesID: series}, o)
+	if got := names(nu.Items); !slices.Equal(got, []string{"One"}) {
+		t.Errorf("unwatched series with SeriesID = %v, want its first episode", got)
+	}
+
+	f.set("u1", "a", e1a, func(r *userdata.Record) { userdata.MarkPlayed(r, time.UnixMilli(2000)) })
+	nu, _ = f.cat.NextUp(ctx, NextUpOptions{}, o)
+	if got := names(nu.Items); !slices.Equal(got, []string{"Two"}) {
+		t.Errorf("next up = %v", got)
+	}
+	f.set("u1", "a", e2a, func(r *userdata.Record) { r.Position, r.LastPlayed = 10, time.UnixMilli(3000) })
+	if nu, _ = f.cat.NextUp(ctx, NextUpOptions{}, o); nu.TotalRecordCount != 1 {
+		t.Error("an in-progress episode is next up by default")
+	}
+	if nu, _ = f.cat.NextUp(ctx, NextUpOptions{}, DTOOptions{UserID: "u1"}); nu.Items[0]["UserData"].(map[string]any)["PlaybackPositionTicks"] != int64(10) {
+		t.Errorf("next up carries the resume position: %v", nu.Items[0]["UserData"])
+	}
+	if nu, _ = f.cat.NextUp(ctx, NextUpOptions{SkipResumable: true}, o); nu.TotalRecordCount != 0 {
+		t.Error("SkipResumable must skip the in-progress episode")
+	}
+
+	res, _ := f.cat.Resume(ctx, Query{}, o)
+	if got := names(res.Items); !slices.Equal(got, []string{"Two"}) {
+		t.Errorf("resume = %v", got)
+	}
+	f.set("u1", "a", m2a, func(r *userdata.Record) { r.Position, r.LastPlayed = 99, time.UnixMilli(9000) })
+	res, _ = f.cat.Resume(ctx, Query{}, o)
+	if got := names(res.Items); !slices.Equal(got, []string{"Brazil", "Two"}) {
+		t.Errorf("resume (most recent first) = %v", got)
+	}
+	res, _ = f.cat.Resume(ctx, Query{IncludeTypes: []string{"Movie"}}, o)
+	if got := names(res.Items); !slices.Equal(got, []string{"Brazil"}) {
+		t.Errorf("resume movies = %v", got)
+	}
+
+	latest, _ := f.cat.Latest(ctx, f.viewID("Shows"), nil, false, true, 10, o)
+	if got := names(latest); !slices.Equal(got, []string{"Two"}) {
+		t.Errorf("latest hiding played = %v", got)
 	}
 }

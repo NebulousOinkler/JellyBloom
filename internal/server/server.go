@@ -23,6 +23,7 @@ import (
 	"github.com/NebulousOinkler/JellyBloom/internal/catalog"
 	"github.com/NebulousOinkler/JellyBloom/internal/playback"
 	"github.com/NebulousOinkler/JellyBloom/internal/proxy"
+	"github.com/NebulousOinkler/JellyBloom/internal/userdata"
 )
 
 const schema = `
@@ -50,6 +51,7 @@ type Options struct {
 	Proxy      *proxy.Proxy
 	Catalog    *catalog.Catalog
 	Playback   *playback.Handler
+	UserData   *userdata.Store
 	// Version reports the web upstream's Jellyfin version. JellyBloom claims
 	// the same version so the jellyfin-web it serves sees a matching server.
 	Version func(ctx context.Context) (string, error)
@@ -63,6 +65,7 @@ type Server struct {
 	auth    *auth.Service
 	proxy   *proxy.Proxy
 	catalog *catalog.Catalog
+	ud      *userdata.Store
 	hub     *hub
 	log     *slog.Logger
 	router  *router
@@ -80,7 +83,7 @@ func New(o Options) (*Server, error) {
 	if _, err := o.DB.Exec(schema); err != nil {
 		return nil, err
 	}
-	s := &Server{opts: o, db: o.DB, auth: o.Auth, proxy: o.Proxy, catalog: o.Catalog, hub: newHub(o.Logger), log: o.Logger}
+	s := &Server{opts: o, db: o.DB, auth: o.Auth, proxy: o.Proxy, catalog: o.Catalog, ud: o.UserData, hub: newHub(o.Logger), log: o.Logger}
 	s.routes()
 	return s, nil
 }
@@ -158,6 +161,8 @@ func (s *Server) routes() {
 		s.hub.serve(w, r, c.user.ID)
 	}))
 
+	s.userStateRoutes(rt)
+	s.listRoutes(rt)
 	s.browseRoutes(rt)
 
 	playbackInfo := s.authed(func(w http.ResponseWriter, r *http.Request, c *caller) {

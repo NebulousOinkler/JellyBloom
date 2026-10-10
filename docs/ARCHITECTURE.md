@@ -222,6 +222,18 @@ injected plugin scripts and config pages.
 - Installing plugins on JellyBloom itself is out of scope, because that would require
   JellyBloom to be a .NET Jellyfin host.
 
+## User state
+
+JellyBloom owns each user's watch state, keyed by unified item ID, so it is the same
+whichever upstream serves an item:
+- played, play count, favorite, likes, resume position, last played; Jellyfin's resume rules
+  (under 5% not resumable, over 90% played, items under 5 minutes played on stop)
+- folders are played when all their playable items are; marking one marks its items
+- playback reports update local state and are forwarded upstream (transcode cleanup)
+- Resume, Next Up, favorites, and played filters/sorts read local state
+- playlists (private, ordered) and collections (shared) hold unified IDs
+- when items merge (identity redirect), their user data and list entries move to the new ID
+
 ## Upstream credentials
 
 JellyBloom needs upstream *tokens*, never passwords. Jellyfin tokens do not expire, can

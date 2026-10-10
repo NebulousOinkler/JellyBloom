@@ -100,6 +100,8 @@ func (p params) query() catalog.Query {
 		Filters:                 p.list("filters"),
 		SeriesID:                p.str("seriesId"),
 		ParentIndexNumber:       p.intPtr("parentIndexNumber"),
+		IsFavorite:              p.boolPtr("isFavorite"),
+		IsPlayed:                p.boolPtr("isPlayed"),
 	}
 	for _, y := range p.list("years") {
 		if n, err := strconv.Atoi(y); err == nil {
@@ -148,11 +150,10 @@ func (s *Server) browseRoutes(rt *router) {
 
 	views := func(w http.ResponseWriter, r *http.Request, c *caller) {
 		res, err := s.catalog.Views(r.Context(), readParams(r).listOptions(c))
-		if err != nil {
-			s.internal(w, err)
-			return
+		if err == nil {
+			err = s.addLocalViews(r.Context(), c, res)
 		}
-		writeJSON(w, res)
+		s.writeResult(w, res, err)
 	}
 	rt.handle(http.MethodGet, "/UserViews", s.authed(views))
 	rt.handle(http.MethodGet, "/Users/{userId}/Views", s.authed(func(w http.ResponseWriter, r *http.Request, c *caller) {
@@ -169,17 +170,39 @@ func (s *Server) browseRoutes(rt *router) {
 		if identity.NormalizeID(parent) == rootFolderID {
 			parent = ""
 		}
-		items, err := s.catalog.Latest(r.Context(), parent, p.list("includeItemTypes"), group, p.int("limit", 20), p.listOptions(c))
+		hidePlayed := s.userConfig(r.Context(), c.user.ID)["HidePlayedInLatest"] != false
+		items, err := s.catalog.Latest(r.Context(), parent, p.list("includeItemTypes"), group, hidePlayed, p.int("limit", 20), p.listOptions(c))
 		if err != nil {
 			s.internal(w, err)
 			return
 		}
 		writeJSON(w, items)
 	})
-	empty := func(w http.ResponseWriter, r *http.Request, c *caller) { writeJSON(w, emptyResult()) }
-	both(http.MethodGet, "/Items/Resume", empty) // user data arrives in phase 7
-	rt.handle(http.MethodGet, "/Shows/NextUp", s.authed(empty))
-	rt.handle(http.MethodGet, "/Shows/Upcoming", s.authed(empty))
+	both(http.MethodGet, "/Items/Resume", func(w http.ResponseWriter, r *http.Request, c *caller) {
+		p := readParams(r)
+		q := p.query()
+		if q.Limit == 0 {
+			q.Limit = 12
+		}
+		res, err := s.catalog.Resume(r.Context(), q, p.listOptions(c))
+		s.writeResult(w, res, err)
+	})
+	rt.handle(http.MethodGet, "/Shows/NextUp", s.authed(func(w http.ResponseWriter, r *http.Request, c *caller) {
+		p := readParams(r)
+		parent := p.str("parentId")
+		if identity.NormalizeID(parent) == rootFolderID {
+			parent = ""
+		}
+		res, err := s.catalog.NextUp(r.Context(), catalog.NextUpOptions{
+			SeriesID: p.str("seriesId"), ParentID: parent, StartIndex: p.int("startIndex", 0), Limit: p.int("limit", 0),
+			SkipResumable:       strings.EqualFold(p.str("enableResumable"), "false"),
+			DisableFirstEpisode: strings.EqualFold(p.str("disableFirstEpisode"), "true"),
+		}, p.listOptions(c))
+		s.writeResult(w, res, err)
+	}))
+	rt.handle(http.MethodGet, "/Shows/Upcoming", s.authed(func(w http.ResponseWriter, r *http.Request, c *caller) {
+		writeJSON(w, emptyResult()) // no air dates for future episodes in upstream libraries
+	}))
 	both(http.MethodGet, "/Items/Filters", func(w http.ResponseWriter, r *http.Request, c *caller) {
 		q := readParams(r).query()
 		q.Recursive = true
@@ -200,16 +223,12 @@ func (s *Server) browseRoutes(rt *router) {
 			writeJSON(w, s.rootFolder())
 			return
 		}
+		if local := s.localItem(r.Context(), c, identity.NormalizeID(id)); local != nil {
+			writeJSON(w, local)
+			return
+		}
 		item, err := s.catalog.Item(r.Context(), id, catalog.DTOOptions{UserID: c.user.ID})
-		if err != nil {
-			s.internal(w, err)
-			return
-		}
-		if item == nil {
-			http.NotFound(w, r)
-			return
-		}
-		writeJSON(w, item)
+		s.writeItem(w, r, item, err)
 	})
 
 	rt.handle(http.MethodGet, "/Shows/{id}/Seasons", s.authed(func(w http.ResponseWriter, r *http.Request, c *caller) {
@@ -293,6 +312,14 @@ func (s *Server) browseRoutes(rt *router) {
 	}
 }
 
+func (s *Server) writeResult(w http.ResponseWriter, res *catalog.QueryResult, err error) {
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	writeJSON(w, res)
+}
+
 func (s *Server) writeItem(w http.ResponseWriter, r *http.Request, item map[string]any, err error) {
 	if err != nil {
 		s.internal(w, err)
@@ -310,13 +337,15 @@ func (s *Server) writeItem(w http.ResponseWriter, r *http.Request, item map[stri
 func (s *Server) items(w http.ResponseWriter, r *http.Request, c *caller) {
 	p := readParams(r)
 	q := p.query()
+	if s.localItems(w, r, c, q, p) {
+		return
+	}
 	if q.ParentID == "" && !q.Recursive && len(q.IDs) == 0 && q.SearchTerm == "" {
 		res, err := s.catalog.Views(r.Context(), p.listOptions(c))
-		if err != nil {
-			s.internal(w, err)
-			return
+		if err == nil {
+			err = s.addLocalViews(r.Context(), c, res)
 		}
-		writeJSON(w, res)
+		s.writeResult(w, res, err)
 		return
 	}
 	res, err := s.catalog.Query(r.Context(), q, p.listOptions(c))

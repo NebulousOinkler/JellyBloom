@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -28,6 +29,7 @@ import (
 	"github.com/NebulousOinkler/JellyBloom/internal/playback"
 	"github.com/NebulousOinkler/JellyBloom/internal/proxy"
 	"github.com/NebulousOinkler/JellyBloom/internal/upstream"
+	"github.com/NebulousOinkler/JellyBloom/internal/userdata"
 )
 
 func hexID(prefix string) string { return prefix + strings.Repeat("0", 32-len(prefix)) }
@@ -224,14 +226,14 @@ var defaultData = map[string]library{
 		views: []map[string]any{{"Id": hexID("va"), "Name": "Movies", "CollectionType": "movies"}},
 		items: map[string][]map[string]any{hexID("va"): {
 			{"Id": shared["a"], "Type": "Movie", "Name": "Shared", "ParentId": hexID("va"), "ProviderIds": map[string]string{"Tmdb": "1"}},
-			{"Id": aOnly, "Type": "Movie", "Name": "A", "ParentId": hexID("va"), "ProviderIds": map[string]string{"Tmdb": "2"}},
+			{"Id": aOnly, "Type": "Movie", "Name": "A", "ParentId": hexID("va"), "ProviderIds": map[string]string{"Tmdb": "2"}, "RunTimeTicks": 72_000_000_000, "MediaType": "Video"},
 		}},
 	},
 	"b": {
 		views: []map[string]any{{"Id": hexID("vb"), "Name": "Movies", "CollectionType": "movies"}},
 		items: map[string][]map[string]any{hexID("vb"): {
 			{"Id": shared["b"], "Type": "Movie", "Name": "Shared", "ParentId": hexID("vb"), "ProviderIds": map[string]string{"Tmdb": "1"}},
-			{"Id": bOnly, "Type": "Movie", "Name": "B", "ParentId": hexID("vb"), "ProviderIds": map[string]string{"Tmdb": "3"}},
+			{"Id": bOnly, "Type": "Movie", "Name": "B", "ParentId": hexID("vb"), "ProviderIds": map[string]string{"Tmdb": "3"}, "RunTimeTicks": 72_000_000_000, "MediaType": "Video"},
 		}},
 	},
 }
@@ -296,8 +298,12 @@ func newEnvWith(t *testing.T, mode identity.Mode, data map[string]library) *env 
 	if err != nil {
 		t.Fatal(err)
 	}
+	ud, err := userdata.Open(idx.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
 	cat = catalog.New(catalog.Options{DB: idx.DB(), Resolver: e.res, Upstreams: []string{"a", "b"},
-		ServerID: e.auth.ServerID(), UpstreamIDs: px.UpstreamIDs})
+		ServerID: e.auth.ServerID(), UpstreamIDs: px.UpstreamIDs, UserData: ud})
 	e.res.OnRebuild(func(ctx context.Context) {
 		if err := cat.Reload(ctx); err != nil {
 			t.Error(err)
@@ -307,7 +313,7 @@ func newEnvWith(t *testing.T, mode identity.Mode, data map[string]library) *env 
 		t.Fatal(err)
 	}
 	e.server, err = New(Options{ServerName: "Bloom", DB: idx.DB(), Auth: e.auth, Proxy: px, Catalog: cat,
-		Playback: playback.New(px, e.res, nil),
+		Playback: playback.New(px, e.res, nil), UserData: ud,
 		Version: func(ctx context.Context) (string, error) {
 			info, err := clients[1].PublicInfo(ctx)
 			if err != nil {
@@ -623,6 +629,9 @@ func TestSocket(t *testing.T) {
 	}
 
 	for e.server.hub.count() == 0 {
+		if ctx.Err() != nil {
+			t.Fatal("socket never registered")
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	e.server.Broadcast("LibraryChanged", map[string]any{"ItemsAdded": []string{"x"}})
@@ -903,5 +912,194 @@ func TestPlayback(t *testing.T) {
 	// Hidden or unknown items have no playback info.
 	if r := e.do("POST", "/Items/"+hexID("dead")+"/PlaybackInfo", e.token, nil); r.code != 404 {
 		t.Errorf("unknown item PlaybackInfo = %d", r.code)
+	}
+}
+
+func ud(t *testing.T, m map[string]any) map[string]any {
+	t.Helper()
+	if u, ok := m["UserData"].(map[string]any); ok {
+		return u
+	}
+	return m
+}
+
+func TestUserState(t *testing.T) {
+	e := newEnv(t, identity.Mode{})
+	e.login()
+	a := e.uid("a", aOnly)
+
+	// Played and unplayed, modern and legacy routes.
+	if r := e.do("POST", "/UserPlayedItems/"+a, e.token, nil); r.code != 200 || r.json(t)["Played"] != true {
+		t.Fatalf("mark played = %d %s", r.code, r.body)
+	}
+	if d := e.do("GET", "/Users/"+e.userID+"/Items/"+a, e.token, nil).json(t); ud(t, d)["Played"] != true || ud(t, d)["PlayCount"] != float64(1) {
+		t.Errorf("item user data = %v", ud(t, d))
+	}
+	e.do("DELETE", "/Users/"+e.userID+"/PlayedItems/"+a, e.token, nil)
+	if d := e.do("GET", "/UserItems/"+a+"/UserData", e.token, nil).json(t); d["Played"] != false {
+		t.Errorf("after unplayed = %v", d)
+	}
+
+	// Favorites and likes, and filtering by them.
+	e.do("POST", "/Users/"+e.userID+"/FavoriteItems/"+a, e.token, nil)
+	e.do("POST", "/UserItems/"+a+"/Rating?likes=true", e.token, nil)
+	favs := e.do("GET", "/Items?Recursive=true&IsFavorite=true", e.token, nil).json(t)["Items"].([]any)
+	if len(favs) != 1 || favs[0].(map[string]any)["Id"] != a || ud(t, favs[0].(map[string]any))["Likes"] != true {
+		t.Errorf("favorites = %v", favs)
+	}
+	if r := e.do("POST", "/UserFavoriteItems/"+hexID("dead"), e.token, nil); r.code != 404 {
+		t.Errorf("unknown item favorite = %d", r.code)
+	}
+
+	// Playback reports: recorded locally and forwarded upstream.
+	body := func(pos int64) map[string]any { return map[string]any{"ItemId": a, "PositionTicks": pos} }
+	e.do("POST", "/Sessions/Playing", e.token, body(0))
+	e.do("POST", "/Sessions/Playing/Progress", e.token, body(36_000_000_000)) // 50% of 2h
+	resume := e.do("GET", "/Users/"+e.userID+"/Items/Resume", e.token, nil).json(t)["Items"].([]any)
+	if len(resume) != 1 || ud(t, resume[0].(map[string]any))["PlaybackPositionTicks"] != float64(36_000_000_000) {
+		t.Errorf("resume = %v", resume)
+	}
+	e.do("POST", "/Sessions/Playing/Stopped", e.token, body(70_000_000_000)) // 97%: watched
+	if d := e.do("GET", "/UserItems/"+a+"/UserData", e.token, nil).json(t); d["Played"] != true || d["PlaybackPositionTicks"] != float64(0) {
+		t.Errorf("after stop at 97%% = %v", d)
+	}
+	if n := len(e.do("GET", "/Items/Resume", e.token, nil).json(t)["Items"].([]any)); n != 0 {
+		t.Errorf("watched item still in resume (%d)", n)
+	}
+	for _, path := range []string{"/Sessions/Playing", "/Sessions/Playing/Progress", "/Sessions/Playing/Stopped"} {
+		if reqs := e.a.find(path); len(reqs) != 1 || !strings.Contains(reqs[0].body, aOnly) {
+			t.Errorf("%s not forwarded upstream with the real ID: %+v", path, reqs)
+		}
+	}
+
+	// Legacy query-parameter reports.
+	b := e.uid("b", bOnly)
+	e.do("POST", "/Users/"+e.userID+"/PlayingItems/"+b+"?positionTicks=0", e.token, nil)
+	e.do("DELETE", "/Users/"+e.userID+"/PlayingItems/"+b+"?positionTicks=20000000000", e.token, nil)
+	if d := e.do("GET", "/UserItems/"+b+"/UserData", e.token, nil).json(t); d["PlaybackPositionTicks"] != float64(20_000_000_000) || d["Played"] != false {
+		t.Errorf("legacy stop at 28%% = %v", d)
+	}
+
+	// Another user's data is not reachable.
+	if r := e.do("POST", "/Users/"+hexID("99")+"/PlayedItems/"+a, e.token, nil); r.code != 403 {
+		t.Errorf("other user = %d", r.code)
+	}
+}
+
+func TestUserDataChangedPush(t *testing.T) {
+	e := newEnv(t, identity.Mode{})
+	e.login()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.srv.URL, "http")+"/socket?api_key="+e.token, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	var msg struct {
+		MessageType string
+		Data        struct {
+			UserId       string
+			UserDataList []map[string]any
+		}
+	}
+	var first map[string]any // ForceKeepAlive; its Data is a number (a decode error would close the socket)
+	if err := wsjson.Read(ctx, conn, &first); err != nil {
+		t.Fatal(err)
+	}
+	for e.server.hub.count() == 0 {
+		if ctx.Err() != nil {
+			t.Fatal("socket never registered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	a := e.uid("a", aOnly)
+	e.do("POST", "/UserFavoriteItems/"+a, e.token, nil)
+	if err := wsjson.Read(ctx, conn, &msg); err != nil || msg.MessageType != "UserDataChanged" ||
+		msg.Data.UserId != e.userID || msg.Data.UserDataList[0]["ItemId"] != a || msg.Data.UserDataList[0]["IsFavorite"] != true {
+		t.Errorf("push = %+v, %v", msg, err)
+	}
+}
+
+func TestPlaylistsAndCollections(t *testing.T) {
+	e := newEnv(t, identity.Mode{})
+	e.login()
+	a, b := e.uid("a", aOnly), e.uid("b", bOnly)
+
+	r := e.do("POST", "/Playlists", e.token, map[string]any{"Name": "Mix", "Ids": []string{a, b, hexID("dead")}, "UserId": e.userID})
+	pl := r.json(t)["Id"].(string)
+	if r.code != 200 || pl == "" {
+		t.Fatalf("create playlist = %d %s", r.code, r.body)
+	}
+	views := e.do("GET", "/UserViews", e.token, nil).json(t)["Items"].([]any)
+	var plView string
+	for _, v := range views {
+		if v.(map[string]any)["CollectionType"] == "playlists" {
+			plView = v.(map[string]any)["Id"].(string)
+		}
+	}
+	if plView == "" {
+		t.Fatalf("no Playlists library in %v", views)
+	}
+	lists := e.do("GET", "/Items?ParentId="+plView, e.token, nil).json(t)["Items"].([]any)
+	if len(lists) != 1 || lists[0].(map[string]any)["Name"] != "Mix" || lists[0].(map[string]any)["ChildCount"] != float64(2) {
+		t.Errorf("playlists = %v", lists)
+	}
+	if typed := e.do("GET", "/Items?IncludeItemTypes=Playlist&Recursive=true", e.token, nil).json(t)["Items"].([]any); len(typed) != 1 {
+		t.Errorf("playlists by type = %v", typed)
+	}
+
+	entries := e.do("GET", "/Playlists/"+pl+"/Items", e.token, nil).json(t)["Items"].([]any)
+	if len(entries) != 2 || entries[0].(map[string]any)["Id"] != a || entries[1].(map[string]any)["PlaylistItemId"] == nil {
+		t.Fatalf("entries = %v (unknown item must be dropped)", entries)
+	}
+	second := entries[1].(map[string]any)["PlaylistItemId"].(string)
+	e.do("POST", "/Playlists/"+pl+"/Items/"+second+"/Move/0", e.token, nil)
+	e.do("POST", "/Playlists/"+pl+"/Items?ids="+a, e.token, nil)
+	ids := func() []string {
+		var out []string
+		for _, it := range e.do("GET", "/Items?ParentId="+pl, e.token, nil).json(t)["Items"].([]any) {
+			out = append(out, it.(map[string]any)["Id"].(string))
+		}
+		return out
+	}
+	if got := ids(); !slices.Equal(got, []string{b, a, a}) {
+		t.Errorf("after move+add = %v", got)
+	}
+	e.do("DELETE", "/Playlists/"+pl+"/Items?entryIds="+second, e.token, nil)
+	if got := ids(); !slices.Equal(got, []string{a, a}) {
+		t.Errorf("after remove = %v", got)
+	}
+	if d := e.do("GET", "/Items/"+pl, e.token, nil).json(t); d["Type"] != "Playlist" || d["MediaType"] != "Video" {
+		t.Errorf("playlist detail = %v", d)
+	}
+
+	// Collections are shared and live in a Collections library.
+	r = e.do("POST", "/Collections?name=Duo&ids="+a+","+b, e.token, nil)
+	col := r.json(t)["Id"].(string)
+	if items := e.do("GET", "/Items?ParentId="+col, e.token, nil).json(t)["Items"].([]any); len(items) != 2 {
+		t.Errorf("collection items = %v", items)
+	}
+	e.do("DELETE", "/Collections/"+col+"/Items?ids="+b, e.token, nil)
+	if items := e.do("GET", "/Items?ParentId="+col, e.token, nil).json(t)["Items"].([]any); len(items) != 1 {
+		t.Errorf("after remove = %v", items)
+	}
+	boxsets := e.do("GET", "/Items?ParentId="+identity.DeriveID("view:boxsets:collections"), e.token, nil).json(t)["Items"].([]any)
+	if len(boxsets) != 1 || boxsets[0].(map[string]any)["Type"] != "BoxSet" {
+		t.Errorf("collections library = %v", boxsets)
+	}
+
+	// Deleting: own lists yes; upstream media never.
+	if r := e.do("DELETE", "/Items/"+pl, e.token, nil); r.code != 204 {
+		t.Errorf("delete playlist = %d", r.code)
+	}
+	if r := e.do("DELETE", "/Items/"+col, e.token, nil); r.code != 204 {
+		t.Errorf("delete collection = %d", r.code)
+	}
+	if r := e.do("DELETE", "/Items/"+a, e.token, nil); r.code != 403 {
+		t.Errorf("delete upstream item = %d, want 403", r.code)
+	}
+	if r := e.do("GET", "/Playlists/"+pl, e.token, nil); r.code != 404 {
+		t.Errorf("deleted playlist = %d", r.code)
 	}
 }

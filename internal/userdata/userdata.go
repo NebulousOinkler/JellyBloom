@@ -1,0 +1,239 @@
+// Package userdata keeps each JellyBloom user's state about items, keyed by
+// unified item ID: played, play count, favorite, likes, resume position, and
+// last played. It applies Jellyfin's playback-report rules, and stores
+// playlists (per user) and collections (shared).
+package userdata
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"strings"
+	"time"
+)
+
+const schema = `
+CREATE TABLE IF NOT EXISTS user_data (
+	user_id       TEXT NOT NULL,
+	item_id       TEXT NOT NULL,
+	played        INTEGER NOT NULL DEFAULT 0,
+	play_count    INTEGER NOT NULL DEFAULT 0,
+	is_favorite   INTEGER NOT NULL DEFAULT 0,
+	likes         INTEGER,             -- NULL: no rating; 1 liked; 0 disliked
+	position      INTEGER NOT NULL DEFAULT 0, -- resume position, ticks
+	last_played   INTEGER NOT NULL DEFAULT 0, -- unix ms; 0 = never
+	audio_stream  INTEGER,
+	sub_stream    INTEGER,
+	PRIMARY KEY (user_id, item_id)
+);
+CREATE INDEX IF NOT EXISTS user_data_resume ON user_data (user_id, last_played);
+
+CREATE TABLE IF NOT EXISTS playlists (
+	id         TEXT PRIMARY KEY,
+	owner      TEXT NOT NULL,
+	name       TEXT NOT NULL,
+	media_type TEXT NOT NULL,
+	created    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS playlist_entries (
+	entry_id    TEXT PRIMARY KEY,
+	playlist_id TEXT NOT NULL,
+	item_id     TEXT NOT NULL,
+	position    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS playlist_entries_list ON playlist_entries (playlist_id, position);
+
+CREATE TABLE IF NOT EXISTS collections (
+	id      TEXT PRIMARY KEY,
+	name    TEXT NOT NULL,
+	created INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collection_items (
+	collection_id TEXT NOT NULL,
+	item_id       TEXT NOT NULL,
+	added         INTEGER NOT NULL,
+	PRIMARY KEY (collection_id, item_id)
+);
+`
+
+// Record is one user's state for one item.
+type Record struct {
+	ItemID         string
+	Played         bool
+	PlayCount      int
+	IsFavorite     bool
+	Likes          *bool
+	Position       int64 // ticks
+	LastPlayed     time.Time
+	AudioStream    *int
+	SubtitleStream *int
+}
+
+// Resumable reports whether playback can resume part-way.
+func (r Record) Resumable() bool { return r.Position > 0 && !r.Played }
+
+// Store persists user data, playlists, and collections. Safe for concurrent use.
+type Store struct {
+	db  *sql.DB
+	now func() time.Time
+}
+
+// Open creates the tables in db.
+func Open(db *sql.DB) (*Store, error) {
+	if _, err := db.Exec(schema); err != nil {
+		return nil, err
+	}
+	return &Store{db: db, now: time.Now}, nil
+}
+
+const recordCols = `item_id, played, play_count, is_favorite, likes, position, last_played, audio_stream, sub_stream`
+
+func scanRecord(sc interface{ Scan(...any) error }) (Record, error) {
+	var r Record
+	var likes, audio, sub sql.NullInt64
+	var last int64
+	err := sc.Scan(&r.ItemID, &r.Played, &r.PlayCount, &r.IsFavorite, &likes, &r.Position, &last, &audio, &sub)
+	if likes.Valid {
+		b := likes.Int64 == 1
+		r.Likes = &b
+	}
+	if audio.Valid {
+		v := int(audio.Int64)
+		r.AudioStream = &v
+	}
+	if sub.Valid {
+		v := int(sub.Int64)
+		r.SubtitleStream = &v
+	}
+	if last > 0 {
+		r.LastPlayed = time.UnixMilli(last)
+	}
+	return r, err
+}
+
+// Get returns the records that exist for ids.
+func (s *Store) Get(ctx context.Context, userID string, ids []string) (map[string]Record, error) {
+	out := map[string]Record{}
+	for start := 0; start < len(ids); start += 400 {
+		chunk := ids[start:min(start+400, len(ids))]
+		args := []any{userID}
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT `+recordCols+` FROM user_data WHERE user_id = ? AND item_id IN (?`+
+			strings.Repeat(",?", len(chunk)-1)+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			r, err := scanRecord(rows)
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[r.ItemID] = r
+		}
+		rows.Close()
+	}
+	return out, nil
+}
+
+// All returns every record of a user.
+func (s *Store) All(ctx context.Context, userID string) (map[string]Record, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+recordCols+` FROM user_data WHERE user_id = ?`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]Record{}
+	for rows.Next() {
+		r, err := scanRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[r.ItemID] = r
+	}
+	return out, rows.Err()
+}
+
+// Update applies fn to the records of ids (missing ones start empty) in one
+// transaction and returns the results.
+func (s *Store) Update(ctx context.Context, userID string, ids []string, fn func(*Record)) (map[string]Record, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	out := map[string]Record{}
+	for _, id := range ids {
+		r, err := scanRecord(tx.QueryRowContext(ctx, `SELECT `+recordCols+` FROM user_data WHERE user_id = ? AND item_id = ?`, userID, id))
+		if errors.Is(err, sql.ErrNoRows) {
+			r, err = Record{ItemID: id}, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		fn(&r)
+		var likes, audio, sub any
+		if r.Likes != nil {
+			likes = map[bool]int{true: 1, false: 0}[*r.Likes]
+		}
+		if r.AudioStream != nil {
+			audio = *r.AudioStream
+		}
+		if r.SubtitleStream != nil {
+			sub = *r.SubtitleStream
+		}
+		var last int64
+		if !r.LastPlayed.IsZero() {
+			last = r.LastPlayed.UnixMilli()
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO user_data (user_id, `+recordCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (user_id, item_id) DO UPDATE SET played = excluded.played, play_count = excluded.play_count,
+				is_favorite = excluded.is_favorite, likes = excluded.likes, position = excluded.position,
+				last_played = excluded.last_played, audio_stream = excluded.audio_stream, sub_stream = excluded.sub_stream`,
+			userID, id, r.Played, r.PlayCount, r.IsFavorite, likes, r.Position, last, audio, sub)
+		if err != nil {
+			return nil, err
+		}
+		out[id] = r
+	}
+	return out, tx.Commit()
+}
+
+// FollowRedirects moves user data, playlist entries, and collection items
+// from unified IDs that were merged into another (identity_redirects) to the
+// surviving ID, combining state when both exist.
+func (s *Store) FollowRedirects(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		// Combine into an existing record for the new ID...
+		`UPDATE user_data AS n SET
+			played = MAX(n.played, o.played), play_count = n.play_count + o.play_count,
+			is_favorite = MAX(n.is_favorite, o.is_favorite), likes = COALESCE(n.likes, o.likes),
+			position = CASE WHEN o.last_played > n.last_played THEN o.position ELSE n.position END,
+			last_played = MAX(n.last_played, o.last_played)
+		FROM identity_redirects r JOIN user_data o ON o.item_id = r.old_id
+		WHERE n.item_id = r.new_id AND n.user_id = o.user_id`,
+		`DELETE FROM user_data WHERE item_id IN (SELECT old_id FROM identity_redirects)
+			AND EXISTS (SELECT 1 FROM user_data n JOIN identity_redirects r ON n.item_id = r.new_id
+				WHERE r.old_id = user_data.item_id AND n.user_id = user_data.user_id)`,
+		// ...or just re-key it.
+		`UPDATE user_data SET item_id = (SELECT new_id FROM identity_redirects WHERE old_id = item_id)
+			WHERE item_id IN (SELECT old_id FROM identity_redirects)`,
+		`UPDATE playlist_entries SET item_id = (SELECT new_id FROM identity_redirects WHERE old_id = item_id)
+			WHERE item_id IN (SELECT old_id FROM identity_redirects)`,
+		`UPDATE OR IGNORE collection_items SET item_id = (SELECT new_id FROM identity_redirects WHERE old_id = item_id)
+			WHERE item_id IN (SELECT old_id FROM identity_redirects)`,
+		`DELETE FROM collection_items WHERE item_id IN (SELECT old_id FROM identity_redirects)`,
+	} {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}

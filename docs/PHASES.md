@@ -131,9 +131,22 @@ with the "done when" check from that table. Target upstream version: Jellyfin 10
   account and permissions apply
 
 ## Phase 7: User state (`internal/userdata`)
-- [ ] Played, favorite, resume position, play count; both route styles
-- [ ] `/Items/Resume`, `/Shows/NextUp`
-- [ ] Playlists and collections over unified IDs
+- [x] Played, favorite, resume position, play count; both route styles
+- [x] `/Items/Resume`, `/Shows/NextUp`
+- [x] Playlists and collections over unified IDs
+- [x] Per-user `UserData` on every item; folders (series, seasons, albums) get
+  `UnplayedItemCount` and played state over their playable items
+- [x] Played/favorite/likes filters and `DatePlayed`/`PlayCount`/`IsFavoriteOrLiked`/`IsPlayed` sorts;
+  Latest hides played items (`HidePlayedInLatest`)
+- [x] Playback reports apply Jellyfin's resume rules (5% / 90% / 300 s) locally and are still
+  forwarded upstream (ending upstream transcodes)
+- [x] `UserDataChanged` pushed to the user's own sockets
+- [x] User data, playlist entries, and collection items follow identity redirects when items merge
+- [x] Playlists are private and ordered (duplicates allowed); collections are shared and appear
+  alongside upstream BoxSets; `DELETE /Items/{id}` works only for JellyBloom's own lists
+- [x] Verified on the rig (`smoke.py`): resume, watched at 95%, Next Up, series counts, favorites,
+  playlists
+- Not done: importing existing watch history from upstream accounts; playlist sharing
 
 ## Phase 8: Redundancy (`internal/sources`)
 - [ ] Partial content hashing, streamed, storing only the digest

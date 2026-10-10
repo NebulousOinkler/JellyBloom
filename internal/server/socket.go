@@ -110,6 +110,17 @@ func (h *hub) broadcast(messageType string, data any) {
 	}
 }
 
+// toUser sends a message to one user's connected clients.
+func (h *hub) toUser(userID, messageType string, data any) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for c := range h.conns {
+		if c.userID == userID {
+			c.send(socketMessage{MessageType: messageType, Data: data})
+		}
+	}
+}
+
 func (h *hub) count() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()

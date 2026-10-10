@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/NebulousOinkler/JellyBloom/internal/identity"
 	"github.com/NebulousOinkler/JellyBloom/internal/rewrite"
+	"github.com/NebulousOinkler/JellyBloom/internal/userdata"
 )
 
 // Resolver is the identity API the catalog needs; *identity.Resolver implements it.
@@ -30,7 +32,16 @@ type Options struct {
 	// UpstreamIDs returns the user and server IDs JellyBloom has on an
 	// upstream, so DTOs can map them to JellyBloom's.
 	UpstreamIDs func(ctx context.Context, upstream string) (userID, serverID string)
-	Logger      *slog.Logger
+	// UserData supplies per-user item state; *userdata.Store implements it.
+	// Without it, items carry neutral user data.
+	UserData UserData
+	Logger   *slog.Logger
+}
+
+// UserData is the per-user state the catalog overlays and filters by.
+type UserData interface {
+	Get(ctx context.Context, userID string, ids []string) (map[string]userdata.Record, error)
+	All(ctx context.Context, userID string) (map[string]userdata.Record, error)
 }
 
 // Catalog answers browse queries. It is safe for concurrent use.
@@ -122,7 +133,195 @@ func (c *Catalog) Views(ctx context.Context, o DTOOptions) (*QueryResult, error)
 // Query runs an /Items query.
 func (c *Catalog) Query(ctx context.Context, q Query, o DTOOptions) (*QueryResult, error) {
 	s := c.snap.Load()
+	if q.needsUser() {
+		var err error
+		if q.user, err = c.allUserData(ctx, o.UserID); err != nil {
+			return nil, err
+		}
+	}
 	return c.result(ctx, s, s.run(q), o)
+}
+
+// allUserData loads a user's records (nil when there is no source or user).
+func (c *Catalog) allUserData(ctx context.Context, userID string) (map[string]userdata.Record, error) {
+	if c.o.UserData == nil || userID == "" {
+		return nil, nil
+	}
+	return c.o.UserData.All(ctx, userID)
+}
+
+// Resume lists items the user can resume, most recently played first.
+func (c *Catalog) Resume(ctx context.Context, q Query, o DTOOptions) (*QueryResult, error) {
+	s := c.snap.Load()
+	user, err := c.allUserData(ctx, o.UserID)
+	if err != nil {
+		return nil, err
+	}
+	q.Recursive, q.user = true, user
+	var hits []*node
+	for _, n := range s.candidates(q) {
+		if user[n.id].Resumable() && q.match(s, n) {
+			hits = append(hits, n)
+		}
+	}
+	s.sort(hits, []string{"DatePlayed"}, []string{"Descending"}, q)
+	return c.result(ctx, s, page(hits, q.StartIndex, q.Limit), o)
+}
+
+// NextUpOptions shapes NextUp.
+type NextUpOptions struct {
+	SeriesID, ParentID  string
+	StartIndex, Limit   int
+	SkipResumable       bool // don't offer an in-progress episode (Jellyfin's enableResumable=false)
+	DisableFirstEpisode bool // with SeriesID: no first episode for an unwatched series
+}
+
+// NextUp returns, per series the user is watching, the next episode after
+// the most recently played one, series most recently watched first. Specials
+// (season 0) are skipped. With SeriesID, an unwatched series offers its first
+// episode.
+func (c *Catalog) NextUp(ctx context.Context, n NextUpOptions, o DTOOptions) (*QueryResult, error) {
+	s := c.snap.Load()
+	user, err := c.allUserData(ctx, o.UserID)
+	if err != nil {
+		return nil, err
+	}
+	type pick struct {
+		ep   *node
+		when time.Time
+	}
+	episodes := map[string][]*node{}
+	for _, e := range s.all {
+		if e.typ == "Episode" && e.series != "" && e.parentIndex != 0 {
+			episodes[e.series] = append(episodes[e.series], e)
+		}
+	}
+	var picks []pick
+	for series, eps := range episodes {
+		if n.SeriesID != "" && series != identity.NormalizeID(n.SeriesID) {
+			continue
+		}
+		if n.ParentID != "" {
+			if sn := s.nodes[series]; sn == nil || !slices.Contains(sn.views, identity.NormalizeID(n.ParentID)) {
+				continue
+			}
+		}
+		slices.SortFunc(eps, func(a, b *node) int {
+			return cmp.Or(cmp.Compare(a.parentIndex, b.parentIndex), cmp.Compare(a.index, b.index))
+		})
+		last, lastAt := -1, time.Time{}
+		for i, e := range eps {
+			if r := user[e.id]; r.Played && (last < 0 || r.LastPlayed.After(lastAt)) {
+				last, lastAt = i, r.LastPlayed
+			}
+		}
+		start := last + 1
+		if last < 0 {
+			if n.SeriesID == "" || n.DisableFirstEpisode {
+				continue // not watching this series
+			}
+			start = 0
+		}
+		for _, e := range eps[start:] {
+			r := user[e.id]
+			if r.Played || r.Resumable() && n.SkipResumable {
+				continue
+			}
+			picks = append(picks, pick{e, lastAt})
+			break
+		}
+	}
+	slices.SortFunc(picks, func(a, b pick) int { return cmp.Or(b.when.Compare(a.when), strings.Compare(a.ep.id, b.ep.id)) })
+	var hits []*node
+	for _, p := range picks {
+		hits = append(hits, p.ep)
+	}
+	return c.result(ctx, s, page(hits, n.StartIndex, n.Limit), o)
+}
+
+// Known reports whether id is a visible item.
+func (c *Catalog) Known(id string) bool { return c.snap.Load().nodes[identity.NormalizeID(id)] != nil }
+
+// Leaves returns the playable items at or below id (id itself for a leaf):
+// marking a series played marks its episodes.
+func (c *Catalog) Leaves(id string) []string {
+	var out []string
+	for _, n := range c.snap.Load().leaves(identity.NormalizeID(id)) {
+		out = append(out, n.id)
+	}
+	return out
+}
+
+// MediaType returns an item's media type ("Video", "Audio", …).
+func (c *Catalog) MediaType(id string) string {
+	if n := c.snap.Load().nodes[identity.NormalizeID(id)]; n != nil {
+		return n.mediaType
+	}
+	return ""
+}
+
+// Runtime returns an item's runtime in ticks (0 if unknown).
+func (c *Catalog) Runtime(id string) int64 {
+	if n := c.snap.Load().nodes[identity.NormalizeID(id)]; n != nil {
+		return n.runtime
+	}
+	return 0
+}
+
+// UserDataDTOs renders the user's data for ids, folders included.
+func (c *Catalog) UserDataDTOs(ctx context.Context, userID string, ids []string) (map[string]map[string]any, error) {
+	return c.userDataDTOs(ctx, c.snap.Load(), userID, ids)
+}
+
+// userDataDTOs builds UserItemDataDtos; folders get unplayed counts over
+// their playable items.
+func (c *Catalog) userDataDTOs(ctx context.Context, s *snapshot, userID string, ids []string) (map[string]map[string]any, error) {
+	out := map[string]map[string]any{}
+	if c.o.UserData == nil || userID == "" {
+		for _, id := range ids {
+			out[id] = userDataStub(id)
+		}
+		return out, nil
+	}
+	need := slices.Clone(ids)
+	leaves := map[string][]*node{}
+	for _, id := range ids {
+		if n := s.nodes[id]; n != nil && n.folder {
+			leaves[id] = s.leaves(id)
+			for _, l := range leaves[id] {
+				need = append(need, l.id)
+			}
+		}
+	}
+	recs, err := c.o.UserData.Get(ctx, userID, need)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		var runtime int64
+		if n := s.nodes[id]; n != nil {
+			runtime = n.runtime
+		}
+		r := recs[id]
+		if ls, folder := leaves[id]; folder {
+			unplayed := 0
+			for _, l := range ls {
+				if !recs[l.id].Played {
+					unplayed++
+				}
+			}
+			r.Played = len(ls) > 0 && unplayed == 0
+			d := r.DTO(id, 0)
+			d["UnplayedItemCount"] = unplayed
+			if len(ls) > 0 && unplayed < len(ls) {
+				d["PlayedPercentage"] = float64(len(ls)-unplayed) / float64(len(ls)) * 100
+			}
+			out[id] = d
+			continue
+		}
+		out[id] = r.DTO(id, runtime)
+	}
+	return out, nil
 }
 
 // Item returns one item (library, entity, or item), or nil if unknown or hidden.
@@ -135,10 +334,18 @@ func (c *Catalog) Item(ctx context.Context, id string, o DTOOptions) (map[string
 	return items[0], nil
 }
 
-// Latest returns recently added items under parent.
-func (c *Catalog) Latest(ctx context.Context, parent string, types []string, group bool, limit int, o DTOOptions) ([]map[string]any, error) {
+// Latest returns recently added items under parent; with hidePlayed, items
+// the user has played are left out (Jellyfin's HidePlayedInLatest).
+func (c *Catalog) Latest(ctx context.Context, parent string, types []string, group, hidePlayed bool, limit int, o DTOOptions) ([]map[string]any, error) {
 	s := c.snap.Load()
-	items, err := c.dtos(ctx, s, s.latest(parent, types, group, limit), o)
+	var skip map[string]userdata.Record
+	if hidePlayed {
+		var err error
+		if skip, err = c.allUserData(ctx, o.UserID); err != nil {
+			return nil, err
+		}
+	}
+	items, err := c.dtos(ctx, s, s.latest(parent, types, group, limit, skip), o)
 	if items == nil {
 		items = []map[string]any{}
 	}
@@ -444,6 +651,11 @@ func (c *Catalog) dtos(ctx context.Context, s *snapshot, ids []string, o DTOOpti
 		return reps[up]
 	}
 
+	uds, err := c.userDataDTOs(ctx, s, o.UserID, ids)
+	if err != nil {
+		return nil, err
+	}
+
 	var out []map[string]any
 	for _, id := range ids {
 		var d map[string]any
@@ -462,7 +674,7 @@ func (c *Catalog) dtos(ctx context.Context, s *snapshot, ids []string, o DTOOpti
 			continue
 		}
 		d["ServerId"] = c.o.ServerID
-		d["UserData"] = userDataStub(id)
+		d["UserData"] = uds[id]
 		trim(d, o.Fields)
 		out = append(out, d)
 	}

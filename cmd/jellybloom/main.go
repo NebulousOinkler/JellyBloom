@@ -30,6 +30,7 @@ import (
 	"github.com/NebulousOinkler/JellyBloom/internal/secrets"
 	"github.com/NebulousOinkler/JellyBloom/internal/server"
 	"github.com/NebulousOinkler/JellyBloom/internal/upstream"
+	"github.com/NebulousOinkler/JellyBloom/internal/userdata"
 )
 
 func main() {
@@ -268,7 +269,12 @@ func run(configPath string) error {
 	if err != nil {
 		return err
 	}
+	ud, err := userdata.Open(store.DB())
+	if err != nil {
+		return err
+	}
 	cat = catalog.New(catalog.Options{
+		UserData:    ud,
 		DB:          store.DB(),
 		Resolver:    resolver,
 		Upstreams:   names,
@@ -276,6 +282,10 @@ func run(configPath string) error {
 		UpstreamIDs: px.UpstreamIDs,
 	})
 	resolver.OnRebuild(func(ctx context.Context) {
+		// Items merged into another keep their users' state under the new ID.
+		if err := ud.FollowRedirects(ctx); err != nil {
+			slog.Error("moving user data to merged items failed", "err", err)
+		}
 		if err := cat.Reload(ctx); err != nil {
 			slog.Error("catalog reload failed", "err", err)
 		}
@@ -293,6 +303,7 @@ func run(configPath string) error {
 		Proxy:      px,
 		Catalog:    cat,
 		Playback:   playback.New(px, resolver, nil),
+		UserData:   ud,
 		Version: func(ctx context.Context) (string, error) {
 			info, err := web.PublicInfo(ctx)
 			if err != nil {

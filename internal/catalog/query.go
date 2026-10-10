@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/NebulousOinkler/JellyBloom/internal/identity"
+	"github.com/NebulousOinkler/JellyBloom/internal/userdata"
 )
 
 // Query is the subset of Jellyfin's /Items parameters JellyBloom answers.
@@ -35,6 +36,68 @@ type Query struct {
 	Filters                        []string
 	SeriesID, SeasonID             string
 	ParentIndexNumber              *int
+	IsFavorite, IsPlayed           *bool
+	KeepOrder                      bool // keep IDs order (playlists) instead of sorting
+
+	// user is the requesting user's data; nil when unavailable, in which case
+	// user-data filters match nothing and user-data sorts are ignored.
+	user map[string]userdata.Record
+}
+
+// needsUser reports whether q filters or sorts by user data.
+func (q Query) needsUser() bool {
+	if q.IsFavorite != nil || q.IsPlayed != nil {
+		return true
+	}
+	for _, f := range q.Filters {
+		switch strings.ToLower(f) {
+		case "isfavorite", "isfavoriteorlikes", "likes", "dislikes", "isresumable", "isplayed", "isunplayed":
+			return true
+		}
+	}
+	for _, k := range q.SortBy {
+		switch strings.ToLower(k) {
+		case "dateplayed", "playcount", "isfavoriteorliked", "isplayed", "isunplayed":
+			return true
+		}
+	}
+	return false
+}
+
+// leaves returns the playable (non-folder) items at or below id.
+func (s *snapshot) leaves(id string) []*node {
+	if n := s.nodes[id]; n != nil && !n.folder {
+		return []*node{n}
+	}
+	var out []*node
+	if _, ok := s.viewByID[id]; ok {
+		for _, n := range s.all {
+			if !n.folder && slices.Contains(n.views, id) {
+				out = append(out, n)
+			}
+		}
+		return out
+	}
+	for _, n := range s.descendants(id) {
+		if !n.folder {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// played: a leaf by its record; a folder when it has leaves and all are played.
+func (q Query) played(s *snapshot, n *node) bool {
+	if !n.folder {
+		return q.user[n.id].Played
+	}
+	ls := s.leaves(n.id)
+	for _, l := range ls {
+		if !q.user[l.id].Played {
+			return false
+		}
+	}
+	return len(ls) > 0
 }
 
 // Result is a page of unified IDs.
@@ -165,9 +228,31 @@ func (q Query) match(s *snapshot, n *node) bool {
 			if n.folder {
 				return false
 			}
-		case "isfavorite", "isfavoriteorlikes", "likes", "isresumable", "isplayed", "dislikes":
-			return false // no user data yet (phase 7): nothing qualifies
+		case "isfavorite", "isfavoriteorlikes", "likes", "dislikes", "isresumable", "isplayed", "isunplayed":
+			if q.user == nil {
+				return false
+			}
+			r := q.user[n.id]
+			liked := r.Likes != nil && *r.Likes
+			ok := map[string]bool{
+				"isfavorite":        r.IsFavorite,
+				"isfavoriteorlikes": r.IsFavorite || liked,
+				"likes":             liked,
+				"dislikes":          r.Likes != nil && !*r.Likes,
+				"isresumable":       r.Resumable(),
+				"isplayed":          q.played(s, n),
+				"isunplayed":        !q.played(s, n),
+			}[strings.ToLower(f)]
+			if !ok {
+				return false
+			}
 		}
+	}
+	if q.IsFavorite != nil && (q.user == nil || q.user[n.id].IsFavorite != *q.IsFavorite) {
+		return false
+	}
+	if q.IsPlayed != nil && (q.user == nil || q.played(s, n) != *q.IsPlayed) {
+		return false
 	}
 	return true
 }
@@ -196,11 +281,35 @@ func (s *snapshot) run(q Query) Result {
 			hits = append(hits, n)
 		}
 	}
-	s.sort(hits, q.SortBy, q.SortOrder)
+	if !q.KeepOrder {
+		s.sort(hits, q.SortBy, q.SortOrder, q)
+	}
 	return page(hits, q.StartIndex, q.Limit)
 }
 
-func (s *snapshot) sort(hits []*node, by, order []string) {
+// userSorter returns a sort key over user data, or nil.
+func (q Query) userSorter(s *snapshot, key string) less {
+	if q.user == nil {
+		return nil
+	}
+	b := func(v bool) int { return map[bool]int{false: 0, true: 1}[v] }
+	switch key {
+	case "dateplayed":
+		return func(a, c *node) int { return q.user[a.id].LastPlayed.Compare(q.user[c.id].LastPlayed) }
+	case "playcount":
+		return func(a, c *node) int { return cmp.Compare(q.user[a.id].PlayCount, q.user[c.id].PlayCount) }
+	case "isfavoriteorliked":
+		fav := func(n *node) bool { r := q.user[n.id]; return r.IsFavorite || r.Likes != nil && *r.Likes }
+		return func(a, c *node) int { return b(fav(a)) - b(fav(c)) }
+	case "isplayed":
+		return func(a, c *node) int { return b(q.played(s, a)) - b(q.played(s, c)) }
+	case "isunplayed":
+		return func(a, c *node) int { return b(!q.played(s, a)) - b(!q.played(s, c)) }
+	}
+	return nil
+}
+
+func (s *snapshot) sort(hits []*node, by, order []string, q Query) {
 	if slices.ContainsFunc(by, func(k string) bool { return strings.EqualFold(k, "Random") }) {
 		rand.Shuffle(len(hits), func(i, j int) { hits[i], hits[j] = hits[j], hits[i] })
 		return
@@ -213,7 +322,10 @@ func (s *snapshot) sort(hits []*node, by, order []string) {
 	for i, k := range by {
 		f := sorters[strings.ToLower(k)]
 		if f == nil {
-			continue // unsupported keys (e.g. DatePlayed before phase 7) are ignored
+			f = q.userSorter(s, strings.ToLower(k))
+		}
+		if f == nil {
+			continue // unsupported keys are ignored
 		}
 		desc := false
 		if len(order) > 0 {
@@ -252,17 +364,17 @@ func page(hits []*node, start, limit int) Result {
 
 // latest returns recently added items under parent, newest first. With group,
 // episodes collapse into their series and tracks into their album.
-func (s *snapshot) latest(parent string, types []string, group bool, limit int) []string {
+func (s *snapshot) latest(parent string, types []string, group bool, limit int, skip map[string]userdata.Record) []string {
 	q := Query{ParentID: parent, Recursive: true, IncludeTypes: types}
 	f := false
 	q.IsFolder = &f
 	var hits []*node
 	for _, n := range s.candidates(q) {
-		if q.match(s, n) {
+		if q.match(s, n) && !skip[n.id].Played {
 			hits = append(hits, n)
 		}
 	}
-	s.sort(hits, []string{"DateCreated"}, []string{"Descending"})
+	s.sort(hits, []string{"DateCreated"}, []string{"Descending"}, Query{})
 	var out []string
 	seen := map[string]bool{}
 	for _, n := range hits {
@@ -368,6 +480,6 @@ func (s *snapshot) artistPage(q Query, albumArtists bool) Result {
 			add(a)
 		}
 	}
-	s.sort(artists, q.SortBy, q.SortOrder)
+	s.sort(artists, q.SortBy, q.SortOrder, q)
 	return page(artists, q.StartIndex, q.Limit)
 }
