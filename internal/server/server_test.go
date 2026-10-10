@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -28,6 +29,7 @@ import (
 	"github.com/NebulousOinkler/JellyBloom/internal/index"
 	"github.com/NebulousOinkler/JellyBloom/internal/playback"
 	"github.com/NebulousOinkler/JellyBloom/internal/proxy"
+	"github.com/NebulousOinkler/JellyBloom/internal/sources"
 	"github.com/NebulousOinkler/JellyBloom/internal/upstream"
 	"github.com/NebulousOinkler/JellyBloom/internal/userdata"
 )
@@ -57,6 +59,9 @@ type fakeUpstream struct {
 	history []recorded
 	media   map[string][]map[string]any // real item ID -> PlaybackInfo media sources
 	members map[string][]string         // real collection ID -> member IDs (Jellyfin links them)
+	files   map[string][]byte           // media source ID -> file served by static streams
+	cut     int64                       // > 0: file bodies end after this many bytes
+	failHLS int                         // != 0: HLS requests get this status
 }
 
 type recorded struct {
@@ -164,9 +169,26 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 			q.Get("DeviceId"), q.Get("MediaSourceId"), q.Get("PlaySessionId"), key)
 		return
 	case strings.Contains(r.URL.Path, "/hls1/"):
+		f.mu.Lock()
+		status := f.failHLS
+		f.mu.Unlock()
+		if status != 0 {
+			http.Error(w, "injected", status)
+			return
+		}
 		w.Header().Set("Content-Type", "video/mp4")
 		w.Write([]byte("SEGMENT " + f.name))
 		return
+	}
+	if strings.Contains(r.URL.Path, "/stream") || strings.HasSuffix(r.URL.Path, "/Download") {
+		f.mu.Lock()
+		data, ok := f.files[queryFold(q, "MediaSourceId")]
+		cut := f.cut
+		f.mu.Unlock()
+		if ok {
+			serveFile(w, r, data, cut)
+			return
+		}
 	}
 	if strings.HasSuffix(r.URL.Path, "/stream") {
 		w.Header().Set("Content-Type", "video/mp4")
@@ -200,6 +222,41 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func queryFold(q url.Values, key string) string {
+	for k, v := range q {
+		if strings.EqualFold(k, key) && len(v) > 0 {
+			return v[0]
+		}
+	}
+	return ""
+}
+
+// serveFile answers a static stream like Jellyfin: Range support, and
+// per-server Last-Modified. cut > 0 ends the body early.
+func serveFile(w http.ResponseWriter, r *http.Request, data []byte, cut int64) {
+	start, end := int64(0), int64(len(data))-1
+	code := http.StatusOK
+	if rng := r.Header.Get("Range"); rng != "" {
+		a, b, _ := strings.Cut(strings.TrimPrefix(rng, "bytes="), "-")
+		start, _ = strconv.ParseInt(a, 10, 64)
+		if b != "" {
+			end, _ = strconv.ParseInt(b, 10, 64)
+		}
+		end = min(end, int64(len(data))-1)
+		code = http.StatusPartialContent
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+	}
+	w.Header().Set("Content-Type", "video/x-matroska")
+	w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+	w.WriteHeader(code)
+	body := data[start : end+1]
+	if cut > 0 && int64(len(body)) > cut {
+		body = body[:cut]
+	}
+	w.Write(body)
+}
+
 func (f *fakeUpstream) lastRequest() (*http.Request, string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -216,6 +273,7 @@ type env struct {
 	t        *testing.T
 	srv      *httptest.Server
 	server   *Server
+	reg      *sources.Registry
 	res      *identity.Resolver
 	auth     *auth.Service
 	a, b     *fakeUpstream
@@ -288,7 +346,7 @@ func newEnvWith(t *testing.T, mode identity.Mode, data map[string]library) *env 
 	}
 
 	h, _ := bcrypt.GenerateFromPassword([]byte("pw"), bcrypt.MinCost)
-	if e.auth, err = auth.New(idx.DB(), []config.User{{Name: "me", PasswordHash: string(h)}}); err != nil {
+	if e.auth, err = auth.New(idx.DB(), []config.User{{Name: "me", PasswordHash: string(h)}, {Name: "boss", PasswordHash: string(h), Admin: true}}); err != nil {
 		t.Fatal(err)
 	}
 	var clients []*upstream.Client
@@ -301,9 +359,26 @@ func newEnvWith(t *testing.T, mode identity.Mode, data map[string]library) *env 
 		clients = append(clients, c)
 	}
 	var cat *catalog.Catalog
+	var px *proxy.Proxy
+	e.reg, err = sources.New(idx.DB(), sources.Options{Upstreams: []string{"a", "b"}, StallTimeout: time.Second,
+		Open: func(ctx context.Context, up, method, path string, q url.Values, hdr http.Header) (*http.Response, error) {
+			return px.Open(ctx, up, proxy.Caller{}, method, path, q, hdr)
+		},
+		Library: sources.LibraryFunc(func(ctx context.Context, fn func(sources.LibraryItem) error) error {
+			return e.res.EachFile(ctx, func(id, typ string, copies []identity.CopyDTO) error {
+				it := sources.LibraryItem{ID: id, Type: typ}
+				for _, c := range copies {
+					it.Copies = append(it.Copies, sources.LibraryCopy{Upstream: c.Upstream, Item: c.ID, DTO: c.DTO})
+				}
+				return fn(it)
+			})
+		})})
+	if err != nil {
+		t.Fatal(err)
+	}
 	policy, _ := proxy.NewPolicy(nil)
-	px, err := proxy.New(proxy.Options{Upstreams: clients, WebUpstream: "b", Resolver: e.res, ServerID: e.auth.ServerID(),
-		Policy: policy, Hidden: func(id string) bool { return cat.Hidden(id) }})
+	px, err = proxy.New(proxy.Options{Upstreams: clients, WebUpstream: "b", Resolver: e.res, ServerID: e.auth.ServerID(),
+		Policy: policy, Hidden: func(id string) bool { return cat.Hidden(id) }, Sources: e.reg})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +397,7 @@ func newEnvWith(t *testing.T, mode identity.Mode, data map[string]library) *env 
 		t.Fatal(err)
 	}
 	e.server, err = New(Options{ServerName: "Bloom", DB: idx.DB(), Auth: e.auth, Proxy: px, Catalog: cat,
-		Playback: playback.New(px, e.res, nil), UserData: ud,
+		Playback: playback.New(px, e.res, e.reg, nil), UserData: ud, Sources: e.reg, Resolver: e.res,
 		Version: func(ctx context.Context) (string, error) {
 			info, err := clients[1].PublicInfo(ctx)
 			if err != nil {
@@ -389,9 +464,11 @@ func (e *env) do(method, path, token string, body any, hdr ...string) resp {
 	return resp{res.StatusCode, res.Header, b}
 }
 
-func (e *env) login() {
+func (e *env) login() { e.loginAs("me") }
+
+func (e *env) loginAs(name string) {
 	e.t.Helper()
-	r := e.do("POST", "/users/authenticatebyname", "", map[string]string{"Username": "me", "Pw": "pw"})
+	r := e.do("POST", "/users/authenticatebyname", "", map[string]string{"Username": name, "Pw": "pw"})
 	if r.code != 200 {
 		e.t.Fatalf("login: %d %s", r.code, r.body)
 	}
@@ -877,7 +954,9 @@ func TestPlayback(t *testing.T) {
 
 	// Direct play of the 4K version goes to a with a's 4K media source.
 	e.do("GET", "/Videos/"+item+"/stream?static=true&MediaSourceId="+v4k["Id"].(string)+"&api_key="+e.token+"&DeviceId=dev1", "", nil)
-	if reqs := e.a.find("/stream"); len(reqs) != 1 || reqs[0].query.Get("MediaSourceId") != a4k {
+	// (JellyBloom's own content checks also read the 1080p copies.)
+	reqs = slices.DeleteFunc(e.a.find("/stream"), func(r recorded) bool { return !strings.Contains(r.auth, `Client="Test"`) })
+	if len(reqs) != 1 || reqs[0].query.Get("MediaSourceId") != a4k {
 		t.Errorf("4K stream requests = %+v", reqs)
 	}
 
@@ -1224,5 +1303,155 @@ func TestUpstreamCollections(t *testing.T) {
 	}
 	if r := e.do("POST", "/Collections/"+a+"/Items?ids="+b, e.token, nil); r.code != 404 {
 		t.Errorf("adding to a movie = %d, want 404", r.code)
+	}
+}
+
+// fileData is a library whose shared movie has a media file on both
+// upstreams, as indexed with Fields=MediaSources.
+func fileData(sizeA, sizeB int) map[string]library {
+	ms := func(id string, size int) []map[string]any {
+		return []map[string]any{mediaSource(id, "h264", 1920, 1080, size)}
+	}
+	data := map[string]library{}
+	for up, lib := range defaultData {
+		items := map[string][]map[string]any{}
+		for v, list := range lib.items {
+			for _, it := range list {
+				c := map[string]any{}
+				for k, val := range it {
+					c[k] = val
+				}
+				if c["Id"] == shared[up] {
+					c["MediaSources"] = ms(shared[up], map[string]int{"a": sizeA, "b": sizeB}[up])
+				}
+				items[v] = append(items[v], c)
+			}
+		}
+		data[up] = library{views: lib.views, items: items}
+	}
+	return data
+}
+
+// withFiles stores file contents on the fakes and their PlaybackInfo.
+func (e *env) withFiles(a, b []byte) {
+	e.a.media = map[string][]map[string]any{shared["a"]: {mediaSource(shared["a"], "h264", 1920, 1080, len(a))}}
+	e.b.media = map[string][]map[string]any{shared["b"]: {mediaSource(shared["b"], "h264", 1920, 1080, len(b))}}
+	e.a.files = map[string][]byte{shared["a"]: a}
+	e.b.files = map[string][]byte{shared["b"]: b}
+}
+
+func testFile(n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i*7 + i/251)
+	}
+	return b
+}
+
+func TestDirectPlayFailsOverMidStream(t *testing.T) {
+	data := testFile(3 << 20)
+	e := newEnvWith(t, identity.Mode{}, fileData(len(data), len(data)))
+	e.withFiles(data, data)
+	e.login()
+	item := e.uid("a", shared["a"])
+	info := e.do("POST", "/Items/"+item+"/PlaybackInfo", e.token, map[string]any{"DeviceProfile": map[string]any{}}).json(t)
+	srcs := info["MediaSources"].([]any)
+	if len(srcs) != 1 {
+		t.Fatalf("identical copies must be one version: %v", srcs)
+	}
+	psid := info["PlaySessionId"].(string)
+	msID := srcs[0].(map[string]any)["Id"].(string)
+
+	// a breaks off after 1 MiB; the client still gets the whole file.
+	e.a.mu.Lock()
+	e.a.cut = 1 << 20
+	e.a.mu.Unlock()
+	url := "/Videos/" + item + "/stream.mkv?Static=true&MediaSourceId=" + msID + "&PlaySessionId=" + psid + "&api_key=" + e.token
+	r := e.do("GET", url, "", nil)
+	if r.code != 200 || !bytes.Equal(r.body, data) {
+		t.Fatalf("stream = %d, %d bytes, identical %v", r.code, len(r.body), bytes.Equal(r.body, data))
+	}
+	if r.header.Get("Last-Modified") != "" {
+		t.Error("an upstream's Last-Modified reached the client")
+	}
+	// The client's range requests go on to b, and so do its reports.
+	r = e.do("GET", url, "", nil, "Range", "bytes=100-199")
+	if r.code != http.StatusPartialContent || !bytes.Equal(r.body, data[100:200]) {
+		t.Errorf("range = %d %q", r.code, r.header.Get("Content-Range"))
+	}
+	e.do("POST", "/Sessions/Playing/Progress", e.token, map[string]any{"ItemId": item, "MediaSourceId": msID, "PlaySessionId": psid, "PositionTicks": 1})
+	if len(e.b.find("/Sessions/Playing/Progress")) != 1 || len(e.a.find("/Sessions/Playing/Progress")) != 0 {
+		t.Errorf("progress went to a %d, b %d times", len(e.a.find("/Sessions/Playing/Progress")), len(e.b.find("/Sessions/Playing/Progress")))
+	}
+}
+
+func TestPlaybackLeavesOutTruncatedCopy(t *testing.T) {
+	data := testFile(2 << 20)
+	short := data[:len(data)*6/10]
+	e := newEnvWith(t, identity.Mode{}, fileData(len(data), len(short)))
+	e.withFiles(data, short)
+	e.login()
+	item := e.uid("a", shared["a"])
+	info := e.do("POST", "/Items/"+item+"/PlaybackInfo", e.token, map[string]any{}).json(t)
+	if srcs := info["MediaSources"].([]any); len(srcs) != 1 || srcs[0].(map[string]any)["Size"] != float64(len(data)) {
+		t.Fatalf("want only a's complete copy: %v", srcs)
+	}
+	// Without a, b's truncated copy is all there is: it is offered.
+	e.a.srv.Close()
+	info = e.do("POST", "/Items/"+item+"/PlaybackInfo", e.token, map[string]any{}).json(t)
+	if srcs := info["MediaSources"].([]any); len(srcs) != 1 || srcs[0].(map[string]any)["Size"] != float64(len(short)) {
+		t.Errorf("only copy: %v", srcs)
+	}
+
+	// The report names it, for admins only.
+	if r := e.do("GET", "/JellyBloom/Report", e.token, nil); r.code != http.StatusForbidden {
+		t.Errorf("non-admin report = %d", r.code)
+	}
+	e.loginAs("boss")
+	rep := e.do("GET", "/JellyBloom/Report", e.token, nil).json(t)
+	broken, _ := rep["Broken"].([]any)
+	if len(broken) != 1 || !strings.Contains(fmt.Sprint(broken[0]), "truncated") {
+		t.Errorf("report broken = %v", rep["Broken"])
+	}
+	for _, u := range rep["Upstreams"].([]any) {
+		if m := u.(map[string]any); m["Name"] == "a" && m["Reachable"] != false {
+			t.Errorf("a is down but reported %v", m)
+		}
+	}
+}
+
+func TestHLSFailsOverToAnotherUpstream(t *testing.T) {
+	e := newEnv(t, identity.Mode{})
+	e.a.media = map[string][]map[string]any{shared["a"]: {mediaSource(shared["a"], "h264", 1920, 1080, 100)}}
+	e.b.media = map[string][]map[string]any{shared["b"]: {mediaSource(shared["b"], "h264", 1920, 1080, 100)}}
+	e.login()
+	item := e.uid("a", shared["a"])
+	info := e.do("POST", "/Items/"+item+"/PlaybackInfo", e.token, map[string]any{}).json(t)
+	psid := info["PlaySessionId"].(string)
+	msID := info["MediaSources"].([]any)[0].(map[string]any)["Id"].(string)
+	// Segment URLs carry a's media source Tag, a GUID only a knows.
+	tag := e.uid("a", hexID("7ac"))
+	seg := func(n int) resp {
+		return e.do("GET", fmt.Sprintf("/videos/%s/hls1/main/%d.ts?MediaSourceId=%s&PlaySessionId=%s&Tag=%s&api_key=%s", item, n, msID, psid, tag, e.token), "", nil)
+	}
+	if r := seg(0); string(r.body) != "SEGMENT a" {
+		t.Fatalf("segment 0 = %q", r.body)
+	}
+	e.a.mu.Lock()
+	e.a.failHLS = http.StatusInternalServerError
+	e.a.mu.Unlock()
+	if r := seg(1); r.code != 200 || string(r.body) != "SEGMENT b" {
+		t.Fatalf("segment 1 = %d %q", r.code, r.body)
+	}
+	// b got b's IDs, including b's own play session.
+	got := e.b.find(".ts")
+	if len(got) != 1 || got[0].path != "/videos/"+shared["b"]+"/hls1/main/1.ts" || got[0].query.Get("PlaySessionId") != hexID("9b") {
+		t.Errorf("b got %+v", got)
+	}
+	// The session now lives on b: the next segment does not try a first.
+	before := len(e.a.find(".ts"))
+	seg(2)
+	if len(e.a.find(".ts")) != before {
+		t.Error("segment 2 tried a again")
 	}
 }

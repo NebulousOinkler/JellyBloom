@@ -26,9 +26,9 @@ segments, no subtitles, no artwork.
 |---------------------|---------------------------|
 | Item metadata (DTO JSON) in the index | Video and audio files, or any part of them |
 | ID mappings | HLS playlists and segments |
-| Version digests (partial content hashes) | Subtitle files |
+| Version digests (sampled-block and 1 MiB block hashes) | Subtitle files |
 | JellyBloom's own users, tokens, user data, playlists | Images and artwork |
-| Source health and throughput stats | Transcode output |
+| Source health: quarantines and content verdicts (speed stats stay in memory) | Transcode output |
 
 Rules for implementation:
 - **Relays stream from memory.** Upstream bodies are copied to the client through a fixed,
@@ -100,13 +100,16 @@ upstream and a video-only upstream together produce Music, Movies, and Shows vie
 ### Redundant sources
 A unified item usually has several copies across upstreams. JellyBloom keeps all of them
 and uses them for three things: playing from the fastest copy, routing around broken
-files, and keeping items available when an upstream is down.
+files, and keeping items available when an upstream is down. `internal/sources` owns
+this.
 
 **Versions vs. sources.** Copies are grouped in two levels:
-- A **version** is a distinct encode. Two copies are the same encode when they match on
-  container, codecs, resolution, bitrate, runtime, and file size, plus a partial content
-  hash (first and last few MB, fetched lazily with Range requests and streamed through the
-  hash; only the digest is stored).
+- A **version** is a distinct encode. Copies are one version when they match on
+  container, runtime, stream layout (codecs, resolution, channels), and file size, and,
+  where it can be checked, on content: a **fingerprint** of 17 sampled 64 KiB blocks
+  (the first, the last, and 15 spread evenly, so one sits at the middle), read with Range
+  requests and streamed through SHA-256. Only the 8-byte digests are stored. Small files
+  are fingerprinted whole.
 - A **source** is one location of a version: `(upstream, realItemId, realMediaSourceId)`.
 
 `PlaybackInfo` shows the client one `MediaSource` per **version**, so clients display
@@ -114,51 +117,99 @@ files, and keeping items available when an upstream is down.
 and never the upstream. Each version's unified `MediaSource.Id` maps to its ordered list of
 sources.
 
+**Content checks.** Fingerprints are taken where grouping depends on them: two or more
+copies that look identical, or an encode present in more than one size. A background
+verifier fingerprints every multi-copy item (one item at a time, paced), resamples
+fingerprints older than 30 days, and forgets copies that are gone; `PlaybackInfo` checks
+what is still missing, bounded to 5 seconds. Checks produce **verdicts**, persisted:
+- *Truncated:* a smaller copy of the same encode whose sampled blocks match the larger
+  copy's bytes at the same offsets. (Jellyfin reports the header's runtime, so a cut-off
+  file otherwise looks like a second version.)
+- *Damaged:* same size, but a sample differs, and this copy's block is mostly zero bytes
+  where the other has data (unreadable sectors, file holes, and failed copies read back
+  as zeros; encoders pad with `0xff`, never zeros). With three or more copies, the minority
+  loses. Copies that differ in most samples are different encodes, not damage.
+- *Disputed:* two copies differ with no evidence either way. They become separate versions
+  (never spliced), and the dispute is re-decided daily (a third copy may settle it).
+
+Sampling catches damage only where a sample lands. **Block hashes taken during playback**
+close the gap at no extra traffic: while relaying a copy that has identical peers, JellyBloom
+hashes each whole 1 MiB block it passes through and stores the hash. When a peer's stored
+hash for the same block differs, the block is re-read from every copy and settled the same
+way, and a relay on the damaged copy moves to a good one at once.
+
+A broken copy is left out of `PlaybackInfo` when a good copy of its encode is available.
+When it is the only copy available, it is still offered and played, and the report lists
+it. Damaged verdicts are re-read daily and dropped if the file was replaced; a truncated
+verdict lapses when the copy's size changes.
+
 **Source ranking** within a version is re-evaluated per play request:
-1. Health. Quarantined sources are skipped.
-2. Measured throughput and latency from JellyBloom to the upstream, as rolling stats from
-   real relays plus light probes.
+1. Health: healthy; then a recent failure (forgiven after 10 minutes); then an unreachable
+   upstream; then quarantined; then broken.
+2. Speed: the expected time to fetch 4 MiB from the upstream, from latency (pings every 30
+   seconds, and response times) and throughput (measured on relays, only in windows where
+   reading from the upstream, not writing to the client, was the bottleneck). An upstream
+   must be 25% faster to pass one earlier in the config, so near-equal upstreams don't flap.
+   An unmeasured upstream counts as fastest, so each gets tried and measured once.
 3. Config order.
 
 Version choice, when the client doesn't pick one, follows the client's `DeviceProfile`:
 direct-play-compatible first, then quality.
 
 **Failover.**
-- *Identical sources (same version):* failover is seamless at the byte level. If an
-  upstream errors, stalls, or truncates mid-relay, JellyBloom reissues the same `Range`
-  request to the next source and keeps writing to the client. The client sees no break.
-  This works for direct play and direct stream, which are the common case.
-- *Transcoded (HLS) playback:* JellyBloom starts a transcode on the next source at the
-  current position and serves the following segments from it. The client may see a brief
-  re-buffer.
+- *Files as stored (direct play with `static=true`, downloads):* JellyBloom relays these
+  itself. A source that errors, stalls (no bytes for `stall_timeout`, default 10 s), or
+  answers with an error before responding is skipped. One that breaks off, stalls, or is
+  found damaged mid-body is replaced by an identical copy (same fingerprint, no verdict):
+  JellyBloom requests the rest of the span (`Range: bytes=pos-last`), checks that the
+  `Content-Range` matches, and keeps writing. The client sees one uninterrupted response.
+  Upstream `ETag`/`Last-Modified` are dropped, since they differ between upstreams for the
+  same file; conditional request headers are never forwarded.
+  Because a client stitches range requests for one URL together, every response for a
+  version comes from copies of the same file: a version from `PlaybackInfo` (which grouped
+  them), or else only copies with the same fingerprint as the best one.
+- *Everything else (HLS, remuxes, subtitles, reports, plugin routes):* if the chosen
+  upstream cannot be reached, or answers a GET with a 5xx, before anything was sent to the
+  client, the request is retried on the next upstream holding the items. For HLS, Jellyfin
+  starts a transcode for any requested segment, so the next upstream's transcode serves
+  the following segments with the same numbers; the client may see a brief re-buffer.
+  IDs minted for one upstream's opaque values (such as a media source `Tag` in segment
+  URLs) only prefer that upstream; they never block a retry.
 - *Different versions:* JellyBloom never switches versions silently. If every source of the
   chosen version fails, playback errors, and the client can pick another version.
 
-**Broken files.** A source is marked unhealthy for that item when it returns upstream 5xx
-on media routes, truncated reads, ffmpeg or transcode failures, or a probe mismatch against
-its version (runtime or stream layout). After N failures it is quarantined, then re-checked
-on a backoff schedule. The other sources keep serving.
+**Health.** A source that fails three times within 10 minutes is quarantined for one
+minute, doubling on each failed re-check up to an hour. When the backoff ends, a one-byte
+read re-checks it; serving successfully ends a quarantine at any time. Quarantines are
+persisted. Connection failures mark the whole upstream unreachable until a request or ping
+succeeds; `PlaybackInfo` skips unreachable upstreams, and waits at most 3 seconds for slower
+upstreams once the first has answered.
 
 **Availability.** An item stays visible and playable while any source is reachable.
 Upstream outages only reduce redundancy.
 
-**Redundancy report** (admin-only JellyBloom endpoint and log): lists items with a single
-source and quarantined sources. JellyBloom does not copy files itself; the report shows
-what needs backing up.
+**Redundancy report.** `GET /JellyBloom/Report` (JellyBloom users with `admin: true`) and
+`jellybloom report` (from the database; `-json`, `-all`). It lists items with a good copy
+on only one upstream, broken, disputed, and quarantined copies with the upstream's file
+path, totals including multi-copy items not checked yet, and (from the server) each
+upstream's reachability, latency, and throughput. JellyBloom does not copy files itself;
+the report shows what needs backing up or replacing.
 
 **Limitation:** media bytes flow through JellyBloom, so "fastest source" means fastest to
 JellyBloom. Regional benefit comes from placing JellyBloom near its clients, or running
 one JellyBloom instance per region with the same config.
 
 ### Active source
-Each `(user, device, unifiedItem)` has an **active source**, the source currently serving
-that item:
-- By default it is the top-ranked source of the top-ranked version.
-- `PlaybackInfo` sets the version the client picked. The source is the best-ranked source
-  within that version, and it can change on failover.
+Each play session (`PlaySessionId` from `PlaybackInfo`, or the user's device and item when
+a request has none) has an **active upstream**, the one serving it:
+- It is set by the first relay, and stays while that upstream is as healthy as the best
+  one, so a session's requests keep going to one place.
 - Streams, HLS, subtitles, progress reports, media segments, and generic-fallback calls for
-  that item all go to the active source. Failover only moves between identical files, so
-  plugin data such as intro timestamps still matches the file being played.
+  that item all prefer the active upstream. A failover (byte-level or a retried request)
+  moves the session, and everything after it follows. Failover only moves between
+  identical files, so plugin data such as intro timestamps still matches the file being
+  played.
+- Sessions are kept in memory and expire after 12 idle hours.
 
 ### Rewriting (applies to every forwarded response)
 - **Requests:** unified IDs → real IDs, and the client token → the upstream token.
@@ -174,8 +225,10 @@ that item:
    `MediaSources` are grouped into versions and ranked. Each version gets a unified
    `MediaSource.Id` that maps to its source list. `TranscodingUrl` is rewritten, and
    `PlaySessionId → active source` is recorded.
-2. **Direct play** (`/Videos/{id}/stream`, `/Audio/{id}/universal`): relayed with the
-   `Range` header passed through, with byte-level failover across identical sources.
+2. **Direct play** (`/Videos/{id}/stream?static=true`, `/Audio/{id}/stream?static=true`,
+   `/Items/{id}/Download`): relayed by the source registry with the `Range` header, with
+   byte-level failover across identical sources. Other streams (remux, `/Audio/{id}/universal`)
+   take the generic path, with retry before the response starts.
 3. **HLS:** playlists are rewritten line by line (URIs, `URI="…"` attributes, `api_key`).
    Segments are routed by `PlaySessionId` or `MediaSourceId`.
 4. **Progress** (`/Sessions/Playing*`): recorded locally *and* forwarded upstream, so the
@@ -312,6 +365,7 @@ merge: difference         # union | intersection | difference
 base: home                # difference only: A in A \ B
 subtract: [friend]        # difference only: B (one or more upstreams)
 web_upstream: home        # upstream serving /web (default: first upstream)
+stall_timeout: 10s        # a relayed file this long without bytes fails over
 upstreams:
   - name: friend
     url: https://jellyfin.example.com

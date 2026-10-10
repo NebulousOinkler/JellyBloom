@@ -9,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -57,6 +58,9 @@ type Config struct {
 	// path) for non-GET requests the generic fallback may forward, e.g. for
 	// plugin endpoints. Built-in rules cover playback and user data.
 	FallbackWriteAllow []string `yaml:"fallback_write_allow"`
+	// StallTimeout is how long a relayed file may stop sending before
+	// JellyBloom fails over to another copy (default 10s).
+	StallTimeout time.Duration `yaml:"stall_timeout"`
 }
 
 var upstreamName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
@@ -90,6 +94,9 @@ func Load(path string) (*Config, error) {
 	}
 	if len(c.Upstreams) == 0 {
 		return nil, fmt.Errorf("no upstreams configured")
+	}
+	if c.StallTimeout < 0 {
+		return nil, fmt.Errorf("stall_timeout must not be negative")
 	}
 	names := map[string]bool{}
 	for i, u := range c.Upstreams {

@@ -112,7 +112,26 @@ type Options struct {
 	// Hidden reports unified IDs hidden by the set operation; list entries
 	// for them are dropped from forwarded responses.
 	Hidden func(id string) bool
-	Logger *slog.Logger
+	// Sources, if set, steers requests to the upstream serving their play
+	// session and away from unreachable upstreams.
+	Sources Sources
+	Logger  *slog.Logger
+}
+
+// Sources is the source registry the proxy consults; *sources.Registry
+// implements it.
+type Sources interface {
+	// Prefer returns the upstream serving a play session the request names
+	// (by play session or item ID for the caller's device), or "".
+	Prefer(user, device string, ids []string) string
+	// Down reports whether an upstream is unreachable.
+	Down(upstream string) bool
+	// UpstreamFailed and UpstreamOK report reachability seen by requests.
+	UpstreamFailed(upstream string, err error)
+	UpstreamOK(upstream string)
+	// Moved records that a request naming ids failed on from and was served
+	// by to, so their play session follows.
+	Moved(user, device string, ids []string, from, to string)
 }
 
 // Proxy forwards requests to upstreams. It is safe for concurrent use.
@@ -124,6 +143,7 @@ type Proxy struct {
 	serverID string
 	policy   *Policy
 	hidden   func(string) bool
+	sources  Sources
 	hc       *http.Client
 	log      *slog.Logger
 
@@ -155,7 +175,7 @@ func New(o Options) (*Proxy, error) {
 	}
 	p := &Proxy{
 		ups: o.Upstreams, byName: map[string]*upstream.Client{}, res: o.Resolver, serverID: o.ServerID,
-		policy: o.Policy, hidden: o.Hidden, log: o.Logger, serverIDs: map[string]string{}, seen: map[string]bool{},
+		policy: o.Policy, hidden: o.Hidden, sources: o.Sources, log: o.Logger, serverIDs: map[string]string{}, seen: map[string]bool{},
 		// No overall timeout: media streams last as long as playback.
 		hc: &http.Client{Transport: o.Transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 	}
@@ -251,46 +271,74 @@ func (p *Proxy) Fallback(w http.ResponseWriter, r *http.Request, c Caller) {
 		rewrite.EachGUID(string(body), collect)
 	}
 
-	up, toUpstream, err := p.route(ctx, guids, c)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	p.logRoute(r, up, c)
-
-	_, upUser, err := up.Session(ctx)
-	if err != nil {
-		p.log.Error("upstream login failed", "upstream", up.Name(), "err", err)
-		http.Error(w, "upstream unavailable", http.StatusBadGateway)
-		return
-	}
-	req := &rewrite.Replacer{GUID: func(n string) (string, bool) {
-		switch n {
-		case c.UserID:
-			return identity.NormalizeID(upUser), c.UserID != ""
-		case p.serverID:
-			id := p.upstreamServerID(ctx, up)
-			return id, id != ""
+	// Send to the best upstream holding the items; if it cannot answer,
+	// try the next one (the body is buffered, so it can be replayed).
+	tried := map[string]bool{}
+	first := ""
+	for {
+		up, toUpstream, more, err := p.route(ctx, guids, c, tried)
+		if err != nil {
+			if len(tried) > 0 {
+				http.Error(w, "upstream unavailable", http.StatusBadGateway)
+			} else {
+				fail(w, err)
+			}
+			return
 		}
-		real, ok := toUpstream[n]
-		return real, ok
-	}}
-	if d, ok := c.device(up.Name()); ok && c.DeviceID != "" {
-		req.Literals = []string{c.DeviceID, d.ID} // e.g. DeviceId= on stream URLs
+		tried[up.Name()] = true
+		p.logRoute(r, up, c)
+
+		_, upUser, err := up.Session(ctx)
+		if err != nil {
+			p.log.Error("upstream login failed", "upstream", up.Name(), "err", err)
+			if p.sources != nil {
+				p.sources.UpstreamFailed(up.Name(), err)
+			}
+			continue
+		}
+		req := &rewrite.Replacer{GUID: func(n string) (string, bool) {
+			switch n {
+			case c.UserID:
+				return identity.NormalizeID(upUser), c.UserID != ""
+			case p.serverID:
+				id := p.upstreamServerID(ctx, up)
+				return id, id != ""
+			}
+			real, ok := toUpstream[n]
+			return real, ok
+		}}
+		if d, ok := c.device(up.Name()); ok && c.DeviceID != "" {
+			req.Literals = []string{c.DeviceID, d.ID} // e.g. DeviceId= on stream URLs
+		}
+		path := req.String(r.URL.Path)
+		// Token parameters stay (send swaps in the upstream token): Jellyfin
+		// copies them into the URLs it generates, e.g. HLS variant playlists.
+		query := req.String(r.URL.Query().Encode())
+		var upBody []byte
+		if body != nil {
+			upBody = []byte(req.String(string(body)))
+		}
+		if !p.forward(w, r, up, path, query, upBody, true, c, more) {
+			if first != "" && first != up.Name() && p.sources != nil {
+				p.sources.Moved(c.UserID, c.DeviceID, guids, first, up.Name())
+			}
+			return
+		}
+		if first == "" {
+			first = up.Name()
+		}
+		p.log.Warn("upstream failed a request; trying another", "upstream", up.Name(), "path", rewrite.Template(r.URL.Path))
 	}
-	path := req.String(r.URL.Path)
-	// Token parameters stay (send swaps in the upstream token): Jellyfin copies
-	// them into the URLs it generates, e.g. HLS variant playlists.
-	query := req.String(r.URL.Query().Encode())
-	if body != nil {
-		body = []byte(req.String(string(body)))
-	}
-	p.forward(w, r, up, path, query, body, true, c)
 }
 
+// errNoUpstream: every upstream able to serve the request was tried.
+var errNoUpstream = &httpError{http.StatusBadGateway, "upstream unavailable"}
+
 // route picks the upstream for a request and maps referenced unified IDs to
-// that upstream's real IDs. A request about invisible items is refused.
-func (p *Proxy) route(ctx context.Context, guids []string, c Caller) (*upstream.Client, map[string]string, error) {
+// that upstream's real IDs, skipping upstreams in exclude. more reports
+// whether another upstream could serve it too. A request about invisible
+// items is refused.
+func (p *Proxy) route(ctx context.Context, guids []string, c Caller, exclude map[string]bool) (chosen *upstream.Client, toUpstream map[string]string, more bool, err error) {
 	var refs []*identity.Unified
 	for _, g := range guids {
 		if g == c.UserID || g == p.serverID {
@@ -301,10 +349,10 @@ func (p *Proxy) route(ctx context.Context, guids []string, c Caller) (*upstream.
 			continue
 		}
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		if !u.Visible {
-			return nil, nil, &httpError{http.StatusNotFound, "item not found"}
+			return nil, nil, false, &httpError{http.StatusNotFound, "item not found"}
 		}
 		u.ID = g // key by the ID the client sent (Lookup may follow a redirect)
 		refs = append(refs, u)
@@ -312,33 +360,37 @@ func (p *Proxy) route(ctx context.Context, guids []string, c Caller) (*upstream.
 
 	// Each referenced item constrains the choice to upstreams holding a
 	// source copy; pick the first upstream (config order) satisfying all.
-	allowed := map[string]bool{}
-	for _, u := range p.ups {
-		allowed[u.Name()] = true
-	}
-	var first *upstream.Client
-	for _, u := range refs {
-		has := map[string]bool{}
-		for _, rf := range u.Refs {
-			if rf.Source {
-				has[rf.Upstream] = true
-			}
+	// An ID minted for one upstream's opaque GUID (a cache tag, say) only
+	// prefers that upstream: it means nothing elsewhere and passes through
+	// unmapped, so it must not keep a request from failing over.
+	constrain := func(relaxed bool) map[string]bool {
+		allowed := map[string]bool{}
+		for _, u := range p.ups {
+			allowed[u.Name()] = !exclude[u.Name()]
 		}
-		next := map[string]bool{}
-		for name := range allowed {
-			if has[name] {
-				next[name] = true
+		for _, u := range refs {
+			if relaxed && u.Minted {
+				continue
 			}
-		}
-		if first == nil {
-			for _, up := range p.ups {
-				if has[up.Name()] {
-					first = up
-					break
+			next := map[string]bool{}
+			for _, rf := range u.Refs {
+				if rf.Source && allowed[rf.Upstream] {
+					next[rf.Upstream] = true
 				}
 			}
+			allowed = next
 		}
-		allowed = next
+		return allowed
+	}
+	strict, allowed := constrain(false), constrain(true)
+	var first *upstream.Client
+	if len(refs) > 0 {
+		for _, up := range p.ups {
+			if slices.ContainsFunc(refs[0].Refs, func(rf identity.Ref) bool { return rf.Source && rf.Upstream == up.Name() }) && !exclude[up.Name()] {
+				first = up
+				break
+			}
+		}
 	}
 	// Preference: the rank order of the first multi-copy alias (a playback
 	// version lists its sources best first), then config order.
@@ -359,19 +411,63 @@ func (p *Proxy) route(ctx context.Context, guids []string, c Caller) (*upstream.
 			break
 		}
 	}
-	chosen := first
+	// Upstreams that know the minted IDs come next, then the upstream
+	// serving the request's play session goes first, and unreachable
+	// upstreams last.
+	known, unknown := []*upstream.Client(nil), []*upstream.Client(nil)
+	for _, up := range pref {
+		if strict[up.Name()] {
+			known = append(known, up)
+		} else {
+			unknown = append(unknown, up)
+		}
+	}
+	pref = append(known, unknown...)
+	if p.sources != nil {
+		if active := p.byName[p.sources.Prefer(c.UserID, c.DeviceID, guids)]; active != nil {
+			pref = append([]*upstream.Client{active}, slices.DeleteFunc(slices.Clone(pref), func(u *upstream.Client) bool { return u == active })...)
+		}
+		up, down := slices.Clone(pref), []*upstream.Client(nil)
+		up = slices.DeleteFunc(up, func(u *upstream.Client) bool {
+			if p.sources.Down(u.Name()) {
+				down = append(down, u)
+				return true
+			}
+			return false
+		})
+		pref = append(up, down...)
+	}
+	chosen = first
 	for _, up := range pref {
 		if allowed[up.Name()] {
 			chosen = up
 			break
 		}
 	}
-	if chosen == nil {
-		chosen = p.ups[0] // no item references: primary upstream
-	} else if len(allowed) == 0 {
+	switch {
+	case chosen != nil && len(refs) > 0 && !slices.ContainsFunc(pref, func(u *upstream.Client) bool { return allowed[u.Name()] }):
+		if exclude[chosen.Name()] {
+			return nil, nil, false, errNoUpstream
+		}
 		p.log.Warn("request references items on different upstreams; using the first item's", "upstream", chosen.Name())
+	case chosen == nil && len(refs) > 0:
+		return nil, nil, false, errNoUpstream
+	case chosen == nil:
+		// No item references: the primary upstream, else the next untried.
+		for _, up := range pref {
+			if !exclude[up.Name()] {
+				chosen = up
+				break
+			}
+		}
+		if chosen == nil {
+			return nil, nil, false, errNoUpstream
+		}
 	}
 
+	for _, up := range pref {
+		more = more || up != chosen && allowed[up.Name()]
+	}
 	m := map[string]string{}
 	for _, u := range refs {
 		var real string
@@ -384,13 +480,13 @@ func (p *Proxy) route(ctx context.Context, guids []string, c Caller) (*upstream.
 			m[u.ID] = identity.NormalizeID(real)
 		}
 	}
-	return chosen, m, nil
+	return chosen, m, more, nil
 }
 
 // Web forwards /web/* to the web upstream unmodified (the stock jellyfin-web
 // UI, including any plugin pages that upstream serves).
 func (p *Proxy) Web(w http.ResponseWriter, r *http.Request) {
-	p.forward(w, r, p.web, r.URL.Path, stripTokens(r.URL.Query()).Encode(), nil, false, Caller{})
+	p.forward(w, r, p.web, r.URL.Path, stripTokens(r.URL.Query()).Encode(), nil, false, Caller{}, false)
 }
 
 // withToken replaces the value of any token query parameter (api_key,
@@ -469,7 +565,10 @@ func externalBase(r *http.Request) string {
 	return scheme + "://" + host
 }
 
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, up *upstream.Client, path, query string, body []byte, rewriteResp bool, c Caller) {
+// forward sends a request to up and relays the response. With retryable
+// set, a failure to connect, or a 5xx answer to a GET or HEAD, is returned
+// (true) without writing anything, so the caller can try another upstream.
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, up *upstream.Client, path, query string, body []byte, rewriteResp bool, c Caller, retryable bool) (retry bool) {
 	ctx := r.Context()
 	var stream io.Reader
 	if body == nil && r.Body != nil && r.ContentLength != 0 {
@@ -477,11 +576,20 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, up *upstream.Cli
 	}
 	resp, a, err := p.send(ctx, up, c, r.Method, path, query, r.Header, body, stream, r.ContentLength)
 	if err != nil {
-		if ctx.Err() == nil {
-			p.log.Warn("upstream request failed", "upstream", up.Name(), "path", rewrite.Template(path), "err", err)
-			http.Error(w, "upstream unavailable", http.StatusBadGateway)
+		if ctx.Err() != nil {
+			return false
 		}
-		return
+		p.log.Warn("upstream request failed", "upstream", up.Name(), "path", rewrite.Template(path), "err", err)
+		if retryable && stream == nil {
+			return true
+		}
+		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+		return false
+	}
+	if retryable && resp.StatusCode >= 500 && resp.StatusCode != http.StatusNotImplemented &&
+		(r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		resp.Body.Close()
+		return true
 	}
 	defer resp.Body.Close()
 	_, upUser, _ := up.Session(ctx)
@@ -501,7 +609,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, up *upstream.Cli
 	if !rewriteResp || !rewrite.IsText(ct) {
 		w.WriteHeader(resp.StatusCode)
 		streamBody(w, resp.Body)
-		return
+		return false
 	}
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxRewriteBody+1))
@@ -509,11 +617,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, up *upstream.Cli
 		if ctx.Err() == nil {
 			http.Error(w, "upstream read failed", http.StatusBadGateway)
 		}
-		return
+		return false
 	}
 	if len(raw) > maxRewriteBody {
 		http.Error(w, "upstream response too large", http.StatusBadGateway)
-		return
+		return false
 	}
 	out := rep.Text(raw)
 	if rewrite.IsJSON(ct) {
@@ -526,6 +634,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, up *upstream.Cli
 	h.Set("Content-Length", fmt.Sprint(len(out)))
 	w.WriteHeader(resp.StatusCode)
 	w.Write(out)
+	return false
 }
 
 // send makes one upstream request for c, retrying once with a fresh login if
@@ -534,6 +643,9 @@ func (p *Proxy) send(ctx context.Context, up *upstream.Client, c Caller, method,
 	body []byte, stream io.Reader, length int64) (*http.Response, *auth, error) {
 	a, err := p.authFor(ctx, up, c)
 	if err != nil {
+		if p.sources != nil && ctx.Err() == nil {
+			p.sources.UpstreamFailed(up.Name(), err)
+		}
 		return nil, nil, err
 	}
 	target := up.BaseURL()
@@ -573,6 +685,16 @@ func (p *Proxy) send(ctx context.Context, up *upstream.Client, c Caller, method,
 			}
 		}
 	}
+	// Every upstream request tells the source registry whether the upstream
+	// is reachable.
+	if p.sources != nil {
+		switch {
+		case err == nil:
+			p.sources.UpstreamOK(up.Name())
+		case ctx.Err() == nil:
+			p.sources.UpstreamFailed(up.Name(), err)
+		}
+	}
 	return resp, a, err
 }
 
@@ -598,6 +720,18 @@ func (p *Proxy) Call(ctx context.Context, r *http.Request, upName string, c Call
 	// The replacer outlives ctx (which may be a short fan-out deadline), so
 	// it resolves IDs under the client request's context.
 	return resp, p.responseReplacer(r.Context(), r, up, a.token, upUser, c), nil
+}
+
+// Open sends one request to the named upstream on behalf of c (zero: as
+// JellyBloom) with extra headers such as Range, and returns the response
+// unmodified: for byte relays and content checks. The caller closes the body.
+func (p *Proxy) Open(ctx context.Context, upName string, c Caller, method, path string, query url.Values, hdr http.Header) (*http.Response, error) {
+	up := p.byName[upName]
+	if up == nil {
+		return nil, fmt.Errorf("proxy: unknown upstream %q", upName)
+	}
+	resp, _, err := p.send(ctx, up, c, method, path, stripTokens(query).Encode(), hdr, nil, nil, 0)
+	return resp, err
 }
 
 // UpstreamUser returns JellyBloom's user ID on an upstream.

@@ -3,11 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -29,6 +32,7 @@ import (
 	"github.com/NebulousOinkler/JellyBloom/internal/redact"
 	"github.com/NebulousOinkler/JellyBloom/internal/secrets"
 	"github.com/NebulousOinkler/JellyBloom/internal/server"
+	"github.com/NebulousOinkler/JellyBloom/internal/sources"
 	"github.com/NebulousOinkler/JellyBloom/internal/upstream"
 	"github.com/NebulousOinkler/JellyBloom/internal/userdata"
 )
@@ -45,6 +49,7 @@ func main() {
 		"hash-password": func([]string) error { return hashPassword() },
 		"pair":          pairCmd,
 		"unpair":        unpairCmd,
+		"report":        reportCmd,
 	}
 	if len(os.Args) > 1 {
 		if cmd, ok := subcommands[os.Args[1]]; ok {
@@ -63,6 +68,102 @@ func main() {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
+}
+
+// library lists items with media files and their copies for the source
+// registry.
+func library(res *identity.Resolver) sources.Library {
+	return sources.LibraryFunc(func(ctx context.Context, fn func(sources.LibraryItem) error) error {
+		return res.EachFile(ctx, func(id, typ string, copies []identity.CopyDTO) error {
+			it := sources.LibraryItem{ID: id, Type: typ}
+			for _, c := range copies {
+				it.Copies = append(it.Copies, sources.LibraryCopy{Upstream: c.Upstream, Item: c.ID, DTO: c.DTO})
+			}
+			return fn(it)
+		})
+	})
+}
+
+// reportCmd: jellybloom report [-config f] [-json] [-all]
+func reportCmd(args []string) error {
+	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	configPath := fs.String("config", "config.yaml", "path to config file")
+	asJSON := fs.Bool("json", false, "print the full report as JSON")
+	all := fs.Bool("all", false, "list every item (default: the first 20 of each list)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: jellybloom report [-config FILE] [-json] [-all]")
+		fmt.Fprintln(os.Stderr, "Lists items with one good copy, and broken, disputed, and quarantined copies, from")
+		fmt.Fprintln(os.Stderr, "JellyBloom's database. Live upstream state is at /JellyBloom/Report (admin users).")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	store, err := index.Open(filepath.Join(cfg.DataDir, "jellybloom.db"))
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	var names []string
+	for _, u := range cfg.Upstreams {
+		names = append(names, u.Name)
+	}
+	resolver, err := identity.New(store, identity.Mode{Op: identity.Op(cfg.Merge), Upstreams: names, Base: cfg.Base, Subtract: cfg.Subtract}, nil)
+	if err != nil {
+		return err
+	}
+	reg, err := sources.New(store.DB(), sources.Options{Upstreams: names, Library: library(resolver)})
+	if err != nil {
+		return err
+	}
+	rep, err := reg.Report(context.Background())
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(rep)
+	}
+	printReport(os.Stdout, rep, *all)
+	return nil
+}
+
+func printReport(w io.Writer, rep *sources.Report, all bool) {
+	t := rep.Totals
+	fmt.Fprintf(w, "%d items with media files; %d have copies on more than one upstream (%d not fully checked yet)\n\n",
+		t.Items, t.MultiCopy, t.Unchecked)
+	section := func(title string, items []sources.ReportItem, show func(sources.ReportCopy) bool) {
+		fmt.Fprintf(w, "%s: %d\n", title, len(items))
+		for i, it := range items {
+			if i == 20 && !all {
+				fmt.Fprintf(w, "  … %d more (use -all)\n", len(items)-20)
+				break
+			}
+			fmt.Fprintf(w, "  %s [%s]\n", it.Name, it.Type)
+			for _, c := range it.Copies {
+				if !show(c) {
+					continue
+				}
+				fmt.Fprintf(w, "      %s: %s  %s", c.Upstream, c.State, c.Path)
+				if c.Reason != "" {
+					fmt.Fprintf(w, "  (%s)", c.Reason)
+				}
+				fmt.Fprintln(w)
+			}
+		}
+		fmt.Fprintln(w)
+	}
+	every := func(sources.ReportCopy) bool { return true }
+	notOK := func(c sources.ReportCopy) bool { return c.State != "ok" }
+	section("Broken copies (truncated or damaged)", rep.Broken, notOK)
+	section("Disputed copies (they differ; neither looks damaged)", rep.Disputed, notOK)
+	section("Quarantined copies (failing repeatedly)", rep.Quarantined, notOK)
+	section("Items with a good copy on only one upstream", rep.SingleCopy, every)
 }
 
 // prompt reads a line from the terminal, without echo when hidden.
@@ -258,13 +359,27 @@ func run(configPath string) error {
 		return err
 	}
 	var cat *catalog.Catalog
-	px, err := proxy.New(proxy.Options{
+	var px *proxy.Proxy
+	reg, err := sources.New(store.DB(), sources.Options{
+		Upstreams: names,
+		// Checks and pings use JellyBloom's own upstream sessions.
+		Open: func(ctx context.Context, up, method, path string, q url.Values, hdr http.Header) (*http.Response, error) {
+			return px.Open(ctx, up, proxy.Caller{}, method, path, q, hdr)
+		},
+		Library:      library(resolver),
+		StallTimeout: cfg.StallTimeout,
+	})
+	if err != nil {
+		return err
+	}
+	px, err = proxy.New(proxy.Options{
 		Upstreams:   clients,
 		WebUpstream: cfg.WebUpstream,
 		Resolver:    resolver,
 		ServerID:    authSvc.ServerID(),
 		Policy:      policy,
 		Hidden:      func(id string) bool { return cat.Hidden(id) },
+		Sources:     reg,
 	})
 	if err != nil {
 		return err
@@ -289,6 +404,7 @@ func run(configPath string) error {
 		if err := cat.Reload(ctx); err != nil {
 			slog.Error("catalog reload failed", "err", err)
 		}
+		reg.Kick() // check new copies
 	})
 	// Start rebuilding only once the catalog hook is registered.
 	wg.Add(1)
@@ -296,14 +412,21 @@ func run(configPath string) error {
 		defer wg.Done()
 		resolver.Run(ctx, time.Second)
 	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		reg.Run(ctx)
+	}()
 	srv, err := server.New(server.Options{
 		ServerName: cfg.ServerName,
 		DB:         store.DB(),
 		Auth:       authSvc,
 		Proxy:      px,
 		Catalog:    cat,
-		Playback:   playback.New(px, resolver, nil),
+		Playback:   playback.New(px, resolver, reg, nil),
 		UserData:   ud,
+		Sources:    reg,
+		Resolver:   resolver,
 		Version: func(ctx context.Context) (string, error) {
 			info, err := web.PublicInfo(ctx)
 			if err != nil {

@@ -21,8 +21,10 @@ import (
 
 	"github.com/NebulousOinkler/JellyBloom/internal/auth"
 	"github.com/NebulousOinkler/JellyBloom/internal/catalog"
+	"github.com/NebulousOinkler/JellyBloom/internal/identity"
 	"github.com/NebulousOinkler/JellyBloom/internal/playback"
 	"github.com/NebulousOinkler/JellyBloom/internal/proxy"
+	"github.com/NebulousOinkler/JellyBloom/internal/sources"
 	"github.com/NebulousOinkler/JellyBloom/internal/userdata"
 )
 
@@ -52,6 +54,13 @@ type Options struct {
 	Catalog    *catalog.Catalog
 	Playback   *playback.Handler
 	UserData   *userdata.Store
+	// Sources relays files with failover and builds the redundancy report;
+	// nil leaves file streams to the generic proxy.
+	Sources *sources.Registry
+	// Resolver maps version IDs from PlaybackInfo to their copies.
+	Resolver interface {
+		Lookup(ctx context.Context, id string) (*identity.Unified, error)
+	}
 	// Version reports the web upstream's Jellyfin version. JellyBloom claims
 	// the same version so the jellyfin-web it serves sees a matching server.
 	Version func(ctx context.Context) (string, error)
@@ -66,6 +75,7 @@ type Server struct {
 	proxy   *proxy.Proxy
 	catalog *catalog.Catalog
 	ud      *userdata.Store
+	sources *sources.Registry
 	hub     *hub
 	log     *slog.Logger
 	router  *router
@@ -83,7 +93,8 @@ func New(o Options) (*Server, error) {
 	if _, err := o.DB.Exec(schema); err != nil {
 		return nil, err
 	}
-	s := &Server{opts: o, db: o.DB, auth: o.Auth, proxy: o.Proxy, catalog: o.Catalog, ud: o.UserData, hub: newHub(o.Logger), log: o.Logger}
+	s := &Server{opts: o, db: o.DB, auth: o.Auth, proxy: o.Proxy, catalog: o.Catalog, ud: o.UserData, sources: o.Sources,
+		hub: newHub(o.Logger), log: o.Logger}
 	s.routes()
 	return s, nil
 }
@@ -164,6 +175,7 @@ func (s *Server) routes() {
 	s.userStateRoutes(rt)
 	s.listRoutes(rt)
 	s.browseRoutes(rt)
+	s.streamRoutes(rt)
 
 	playbackInfo := s.authed(func(w http.ResponseWriter, r *http.Request, c *caller) {
 		s.opts.Playback.PlaybackInfo(w, r, proxyCaller(c))

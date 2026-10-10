@@ -178,43 +178,58 @@ and diffs the results; it found the first group, the rig the rest.
 - Not done: importing existing watch history from upstream accounts; playlist sharing
 
 ## Phase 8: Redundancy (`internal/sources`)
-- [ ] Rig: a fault-injecting proxy in front of server b (throttle, latency, cut a body
-  after N bytes, 5xx on media routes), so failover is testable on demand
-- [ ] Source registry: each version's sources with digest, health, and stats; digests and
-  health persisted in SQLite, stats in memory
-- [ ] Content identity: size plus a partial digest (first and last few MB, plus sampled
-  blocks across the file), streamed through the hash, storing only the digest; versions
-  split when digests differ
-- [ ] Throughput and latency stats per upstream from relays (and light probes)
-- [ ] Ranking: health, then measured speed, then config order, applied per PlaybackInfo
-- [ ] Active source per play session, so streams, segments, and reports follow failover
-- [ ] Byte-level failover across identical sources mid-relay (error, stall, or short body:
-  reissue the Range from the current offset to the next source)
-- [ ] HLS failover: Jellyfin produces any segment on demand, so the next source's transcode
-  serves the same segment numbers
-- [ ] Health tracking, quarantine, and backoff re-checks; a truncated or damaged copy is
-  quarantined and its duplicate version hidden
-- [ ] Redundancy report (admin): single-copy items and quarantined sources
+Decisions (2026-10-10): sampled-block fingerprints plus block hashes taken during playback
+(no full background hashing); speed measured passively from playback plus latency pings (no
+periodic range-read probes); the redundancy report is an admin-only endpoint plus a CLI; a
+broken copy that is the only one available is still served, and reported.
 
-Rig scenarios ready (`testrig/media.sh`, `testrig/servers.sh stop-server|start-server`):
-- *Long Test Pattern*: 10 minutes, byte-identical on a and b: byte-level and HLS failover
-  (stop b mid-play; playback must continue from a)
-- *Damaged Pattern*: same size on both, b's copy has 1 MiB zeroed mid-file. Today it is
-  one version with two sources, so failover could splice damaged bytes; first/last-MB
-  hashes alone do not catch it
-- *Truncated Pattern*: b's copy cut at 60% but its header still claims the full runtime.
-  Today it shows as a confusing second version, "360p H264 (2)"
-- Baseline: with b stopped, PlaybackInfo answers at once from a; when b returns, its
-  copies come back
-
-Decisions needed before starting (recommendations first):
-1. Integrity checking: sampled-block digests plus block hashes taken during playback
-   relays (no extra traffic) / first-and-last-MB only (misses mid-file damage) / full
-   background hashing (reads whole libraries over the network)
-2. Speed measurement: passive from real playback plus latency pings / also periodic
-   range-read probes (extra upstream traffic)
-3. Redundancy report: admin-only JSON endpoint plus `jellybloom report` CLI / log only
-4. A broken copy that is the only copy: keep serving it and report it / hide it
+- [x] Rig: `testrig/faultproxy` in front of both servers (JellyBloom reaches a via :8211 and
+  b via :8212): outage, latency, throttling, bodies that break off or stall, error statuses
+  on media; `servers.sh faults a|b JSON|clear`
+- [x] Source registry: fingerprints, verdicts, quarantines, and block hashes in SQLite;
+  speed stats and play sessions in memory
+- [x] Content identity: 17 sampled 64 KiB blocks (first, last, 15 between, one at the middle),
+  streamed through SHA-256, 8-byte digests stored; small files whole. Versions split when
+  fingerprints differ; truncated copies (a prefix of a longer copy) and damaged copies
+  (a zeroed block where the peer has data, or the minority of three or more) are left out
+  when a good copy is available; disputed pairs become separate versions
+- [x] Block hashes during playback: 1 MiB blocks of copies with identical peers; a block
+  that disagrees is re-read from every copy and settled, and a relay on the damaged copy
+  moves to a good one
+- [x] Background verifier: every multi-copy item, paced; resamples fingerprints after 30
+  days; re-reads damaged evidence and re-decides disputes daily; forgets copies that are gone
+- [x] Throughput (relay windows where the upstream was the bottleneck) and latency (pings
+  every 30 s, response times) per upstream
+- [x] Ranking: health, then speed (25% margin to pass an earlier upstream; unmeasured counts
+  as fastest, so each is measured once), then config order; applied per PlaybackInfo and
+  per relay
+- [x] Active upstream per play session (by `PlaySessionId`, or device and item): streams,
+  HLS, reports, and fallback calls follow it, and failovers move it
+- [x] Byte-level failover for files as stored (`static=true` streams, downloads): error or
+  stall before responding, or a break-off, stall, or damage mid-body, continues from an
+  identical copy with `Range: bytes=pos-last`; per-upstream `ETag`/`Last-Modified` dropped
+- [x] Retry for everything else (HLS, remux, subtitles, reports, plugin routes): an
+  unreachable upstream, or a 5xx to a GET, before anything was sent is retried on the next
+  upstream holding the items. HLS continues on the next upstream's transcode. IDs minted for
+  one upstream's opaque values (the `Tag` in segment URLs) never block a retry
+- [x] Health: three failures in 10 minutes quarantine a source (1 min, doubling to 1 h, with
+  one-byte re-checks; persisted); a success ends it. Connection failures mark the upstream
+  unreachable until a request or ping succeeds. PlaybackInfo skips unreachable upstreams and
+  waits at most 3 s for slower ones after the first answer
+- [x] Redundancy report: `GET /JellyBloom/Report` (users with `admin: true`) and
+  `jellybloom report [-json] [-all]`: single-copy items, broken, disputed, and quarantined
+  copies with file paths, unchecked multi-copy items, live upstream state
+- [x] Verified on the rig (`testrig/failover.py`, 28 checks): the verifier finds b's damaged
+  and truncated copies; each movie is one version; direct play survives the active upstream
+  breaking off at 30 MB, stalling at 20 MB, or answering 500, byte-exact; repeated failures
+  quarantine a copy, and serving it as the only copy ends that; the damaged copy is served
+  while a is down; HLS segments continue from the other upstream's transcode when the
+  transcoding upstream goes down; a throttled upstream loses plays to the faster one;
+  PlaybackInfo answers in under 5 s when b takes 8 s. `smoke.py` and `compare.py` still pass
+- Limits: sampling catches damage only where a sample lands; damage elsewhere is found once
+  both copies have been played over it (the first such play may show a glitch). Remuxed
+  streams and `/Audio/{id}/universal` can only fail over before they start. Speed is
+  measured to JellyBloom, not to the client
 
 ## Phase 9: Set operations and hardening
 - [ ] Integration tests for intersection and difference

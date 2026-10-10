@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS lazy_mappings (
 	real_id    TEXT NOT NULL,
 	unified_id TEXT NOT NULL,
 	rank       INTEGER NOT NULL DEFAULT 0,
+	alias      INTEGER NOT NULL DEFAULT 0, -- set by SetAliases; 0 when minted
 	PRIMARY KEY (upstream, real_id)
 );
 CREATE INDEX IF NOT EXISTS lazy_mappings_unified ON lazy_mappings (unified_id, rank);
@@ -103,6 +104,16 @@ func New(idx *index.Store, mode Mode, logger *slog.Logger) (*Resolver, error) {
 	}
 	if _, err := idx.DB().Exec(schema); err != nil {
 		return nil, fmt.Errorf("identity: init schema: %w", err)
+	}
+	// Added after the first release.
+	var hasAlias bool
+	if err := idx.DB().QueryRow(`SELECT COUNT(*) > 0 FROM pragma_table_info('lazy_mappings') WHERE name = 'alias'`).Scan(&hasAlias); err != nil {
+		return nil, fmt.Errorf("identity: init schema: %w", err)
+	}
+	if !hasAlias {
+		if _, err := idx.DB().Exec(`ALTER TABLE lazy_mappings ADD COLUMN alias INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return nil, fmt.Errorf("identity: init schema: %w", err)
+		}
 	}
 	return &Resolver{idx: idx, db: idx.DB(), mode: mode, log: logger, notify: make(chan struct{}, 1)}, nil
 }
@@ -668,8 +679,13 @@ type Unified struct {
 	ID      string
 	Type    string // "" for lazy mappings
 	Visible bool
-	Lazy    bool // minted for a non-indexed upstream GUID
-	Refs    []Ref
+	Lazy    bool // a non-indexed upstream GUID: minted, or an alias
+	// Minted marks a lazy ID minted for one upstream's GUID that JellyBloom
+	// knows nothing about (a cache tag, say), as opposed to an alias that
+	// stands for objects JellyBloom set up (versions, play sessions, merged
+	// libraries).
+	Minted bool
+	Refs   []Ref
 }
 
 // ErrNotFound is returned for unknown unified IDs.
@@ -712,16 +728,19 @@ func (r *Resolver) Lookup(ctx context.Context, id string) (*Unified, error) {
 	u := &Unified{ID: id}
 	err := r.db.QueryRowContext(ctx, `SELECT type, visible FROM unified_items WHERE unified_id = ?`, id).Scan(&u.Type, &u.Visible)
 	if errors.Is(err, sql.ErrNoRows) {
-		rows, err := r.db.QueryContext(ctx, `SELECT upstream, real_id FROM lazy_mappings WHERE unified_id = ? ORDER BY rank`, id)
+		rows, err := r.db.QueryContext(ctx, `SELECT upstream, real_id, alias FROM lazy_mappings WHERE unified_id = ? ORDER BY rank`, id)
 		if err != nil {
 			return nil, err
 		}
 		defer rows.Close()
+		u.Minted = true
 		for rows.Next() {
 			rf := Ref{Source: true}
-			if err := rows.Scan(&rf.Upstream, &rf.ID); err != nil {
+			var alias bool
+			if err := rows.Scan(&rf.Upstream, &rf.ID, &alias); err != nil {
 				return nil, err
 			}
+			u.Minted = u.Minted && !alias
 			u.Refs = append(u.Refs, rf)
 		}
 		if err := rows.Err(); err != nil {
@@ -798,8 +817,8 @@ func (r *Resolver) SetAliases(ctx context.Context, aliases []Alias) error {
 		return err
 	}
 	defer delID.Close()
-	upsert, err := tx.PrepareContext(ctx, `INSERT INTO lazy_mappings (upstream, real_id, unified_id, rank) VALUES (?, ?, ?, ?)
-		ON CONFLICT (upstream, real_id) DO UPDATE SET unified_id = excluded.unified_id, rank = excluded.rank`)
+	upsert, err := tx.PrepareContext(ctx, `INSERT INTO lazy_mappings (upstream, real_id, unified_id, rank, alias) VALUES (?, ?, ?, ?, 1)
+		ON CONFLICT (upstream, real_id) DO UPDATE SET unified_id = excluded.unified_id, rank = excluded.rank, alias = 1`)
 	if err != nil {
 		return err
 	}
@@ -815,4 +834,61 @@ func (r *Resolver) SetAliases(ctx context.Context, aliases []Alias) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// CopyDTO is one source copy of a unified item with its indexed DTO.
+type CopyDTO struct {
+	Upstream string
+	ID       string // real item ID
+	DTO      json.RawMessage
+}
+
+// fileTypes are the item types that have media files.
+var fileTypes = []string{"Movie", "Episode", "Audio", "AudioBook", "MusicVideo", "Video", "Trailer"}
+
+// EachFile calls fn for every visible item that has media files, with its
+// source copies' DTOs (preferred upstream first is not implied).
+func (r *Resolver) EachFile(ctx context.Context, fn func(id, typ string, copies []CopyDTO) error) error {
+	q := `SELECT u.unified_id, u.type, m.upstream, m.real_id, i.dto FROM unified_items u
+		JOIN mappings m ON m.unified_id = u.unified_id AND m.is_source = 1
+		JOIN items i ON i.upstream = m.upstream AND i.real_id = m.real_id
+		WHERE u.visible = 1 AND u.type IN (?` + strings.Repeat(", ?", len(fileTypes)-1) + `)
+		ORDER BY u.unified_id, m.upstream, m.real_id`
+	args := make([]any, len(fileTypes))
+	for i, t := range fileTypes {
+		args[i] = t
+	}
+	rows, err := r.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var id, typ string
+	var copies []CopyDTO
+	flush := func() error {
+		if id == "" {
+			return nil
+		}
+		return fn(id, typ, copies)
+	}
+	for rows.Next() {
+		var uid, t string
+		var c CopyDTO
+		var dto []byte
+		if err := rows.Scan(&uid, &t, &c.Upstream, &c.ID, &dto); err != nil {
+			return err
+		}
+		c.DTO = dto
+		if uid != id {
+			if err := flush(); err != nil {
+				return err
+			}
+			id, typ, copies = uid, t, nil
+		}
+		copies = append(copies, c)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return flush()
 }
