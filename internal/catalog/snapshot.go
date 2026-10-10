@@ -298,9 +298,25 @@ func build(ctx context.Context, db *sql.DB, upstreams []string) (*snapshot, []id
 	}
 	rows.Close()
 
+	// A library's physical root folder (a Folder in the library with no
+	// indexed parent) is transparent, as in Jellyfin: its contents appear
+	// directly under the library, and it is never listed itself.
+	transparent := map[string]string{} // folder unified ID -> library ID
+	for u, n := range s.nodes {
+		if n.typ == "Folder" && len(n.parents) == 0 && len(n.views) > 0 {
+			transparent[u] = n.views[0]
+			delete(s.nodes, u)
+		}
+	}
 	for _, u := range s.byRef {
 		if s.nodes[u] == nil {
 			s.hidden[u] = true
+		}
+	}
+	// References to a root folder (e.g. a movie's ParentId) show the library.
+	for r, u := range s.byRef {
+		if lib, ok := transparent[u]; ok {
+			s.byRef[r] = lib
 		}
 	}
 	for _, n := range s.nodes {

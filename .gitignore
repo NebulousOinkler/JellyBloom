@@ -3,3 +3,4 @@ config.yaml
 *.test
 .DS_Store
 /data/
+/testrig/data/

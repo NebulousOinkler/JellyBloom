@@ -267,7 +267,9 @@ func (p *Proxy) Fallback(w http.ResponseWriter, r *http.Request, c Caller) {
 		req.Literals = []string{c.DeviceID, d.ID} // e.g. DeviceId= on stream URLs
 	}
 	path := req.String(r.URL.Path)
-	query := req.String(stripTokens(r.URL.Query()).Encode())
+	// Token parameters stay (send swaps in the upstream token): Jellyfin copies
+	// them into the URLs it generates, e.g. HLS variant playlists.
+	query := req.String(r.URL.Query().Encode())
 	if body != nil {
 		body = []byte(req.String(string(body)))
 	}
@@ -377,6 +379,26 @@ func (p *Proxy) route(ctx context.Context, guids []string, c Caller) (*upstream.
 // UI, including any plugin pages that upstream serves).
 func (p *Proxy) Web(w http.ResponseWriter, r *http.Request) {
 	p.forward(w, r, p.web, r.URL.Path, stripTokens(r.URL.Query()).Encode(), nil, false, Caller{})
+}
+
+// withToken replaces the value of any token query parameter (api_key,
+// ApiKey) with the upstream token, keeping the parameter's spelling.
+func withToken(query, token string) string {
+	q, err := url.ParseQuery(query)
+	if err != nil {
+		return query
+	}
+	changed := false
+	for k := range q {
+		if strings.EqualFold(k, "api_key") || strings.EqualFold(k, "apikey") {
+			q[k] = []string{token}
+			changed = true
+		}
+	}
+	if !changed {
+		return query
+	}
+	return q.Encode()
 }
 
 // stripTokens removes client token query parameters; the upstream gets its own.
@@ -512,6 +534,7 @@ func (p *Proxy) send(ctx context.Context, up *upstream.Client, c Caller, method,
 		if body != nil {
 			rb = bytes.NewReader(body)
 		}
+		target.RawQuery = withToken(query, token)
 		req, err := http.NewRequestWithContext(ctx, method, target.String(), rb)
 		if err != nil {
 			return nil, err

@@ -74,7 +74,8 @@ with the "done when" check from that table. Target upstream version: Jellyfin 10
 - [x] Image relay (cache headers passed through)
 - [x] `Fields=` trimming and a `UserData` overlay stub
 - [x] **Milestone (against fake upstreams):** a music-only and a video-only upstream browse as one server
-- [ ] **Milestone (real):** verify in jellyfin-web against two real Jellyfin servers
+- [x] **Milestone (real, API level):** verified against two real Jellyfin 12.2 servers with `testrig/smoke.py`
+- [ ] **Milestone (real, UI):** click through jellyfin-web at http://127.0.0.1:8200/web/
 - Libraries merge by collection type + folded name ("Movies" on two servers → one; "Kids
   Movies" stays separate); libraries whose items are all hidden are omitted.
 - Genres, studios, people, and libraries get derived IDs aliased to every upstream copy, so
@@ -104,6 +105,16 @@ with the "done when" check from that table. Target upstream version: Jellyfin 10
   throughput and adds failover.
 - Follow-ups for phase 9: prune old play-session aliases; consider hiding upstream file
   `Path` in media sources.
+
+## Findings from the real rig (Jellyfin 12.2)
+- Library contents sit under a physical root `Folder`; it is now transparent, as in Jellyfin.
+- Jellyfin copies the request's `ApiKey` into generated URLs (HLS variants), so the proxy
+  swaps token parameters for the upstream token instead of stripping them.
+- Artwork/metadata-only changes send no `LibraryChanged`; a finished scan
+  (`RefreshProgress` 100 for a library root) now triggers a full resync.
+- `LibraryChanged` arrives ~30 s after a change. Library IDs are derived from the library
+  name, so same-named libraries share IDs across servers; item IDs differ. URLs use dashed
+  GUIDs.
 
 ## Phase 7: User state (`internal/userdata`)
 - [ ] Played, favorite, resume position, play count; both route styles

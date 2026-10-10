@@ -15,8 +15,8 @@ func ms(js string) map[string]any {
 
 func TestLabel(t *testing.T) {
 	for js, want := range map[string]string{
-		`{"MediaStreams":[{"Type":"Video","Codec":"hevc","Height":2160,"VideoRange":"HDR"}]}`: "4K HEVC HDR",
-		`{"MediaStreams":[{"Type":"Video","Codec":"h264","Height":720,"VideoRange":"SDR"}]}`:  "720p H264",
+		`{"MediaStreams":[{"Type":"Video","Codec":"hevc","Height":2160,"VideoRange":"HDR"}]}`:    "4K HEVC HDR",
+		`{"MediaStreams":[{"Type":"Video","Codec":"h264","Height":720,"VideoRange":"SDR"}]}`:     "720p H264",
 		`{"Container":"flac","Bitrate":900000,"MediaStreams":[{"Type":"Audio","Codec":"flac"}]}`: "FLAC 900kbps",
 	} {
 		if got := label(ms(js)); got != want {

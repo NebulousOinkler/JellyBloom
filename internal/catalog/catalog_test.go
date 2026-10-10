@@ -414,3 +414,43 @@ func TestDifferenceHidesItemsAndLibraries(t *testing.T) {
 		t.Errorf("views under a \\ b = %v, want only libraries with visible items", got)
 	}
 }
+
+// TestRootFoldersAreTransparent mirrors how Jellyfin really links library
+// contents: items sit under a physical root Folder whose parent is not an
+// indexed item. Jellyfin shows the folder's contents directly in the library.
+func TestRootFoldersAreTransparent(t *testing.T) {
+	ctx := context.Background()
+	idx, err := index.Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { idx.Close() })
+	lib, root, folder, movie := g("c1"), g("c2"), g("c3"), g("c4")
+	put(t, idx, "a", []dto{{"Id": lib, "Name": "Movies", "CollectionType": "movies"}}, map[string][]dto{lib: {
+		{"Id": folder, "Type": "Folder", "Name": "movies", "IsFolder": true, "ParentId": root},
+		{"Id": movie, "Type": "Movie", "Name": "Heat", "ParentId": folder, "ProviderIds": dto{"Tmdb": "949"}},
+	}})
+	res, _ := identity.New(idx, identity.Mode{Op: identity.Union, Upstreams: []string{"a"}}, nil)
+	cat := New(Options{DB: idx.DB(), Resolver: res, Upstreams: []string{"a"}, ServerID: "s"})
+	res.OnRebuild(func(ctx context.Context) { cat.Reload(ctx) })
+	if _, err := res.Rebuild(ctx); err != nil {
+		t.Fatal(err)
+	}
+	views, _ := cat.Views(ctx, DTOOptions{})
+	libID := views.Items[0]["Id"].(string)
+	top, _ := cat.Query(ctx, Query{ParentID: libID}, DTOOptions{})
+	if got := names(top.Items); !slices.Equal(got, []string{"Heat"}) {
+		t.Errorf("library top level = %v, want the folder's contents", got)
+	}
+	all, _ := cat.Query(ctx, Query{ParentID: libID, Recursive: true}, DTOOptions{})
+	if got := names(all.Items); !slices.Equal(got, []string{"Heat"}) {
+		t.Errorf("recursive listing = %v, want no root folder", got)
+	}
+	m, _ := cat.Query(ctx, Query{ParentID: libID}, DTOOptions{Fields: []string{"ParentId"}})
+	if m.Items[0]["ParentId"] != libID {
+		t.Errorf("movie ParentId = %v, want the library %s", m.Items[0]["ParentId"], libID)
+	}
+	if views.Items[0]["ChildCount"] != 1 {
+		t.Errorf("library ChildCount = %v", views.Items[0]["ChildCount"])
+	}
+}

@@ -423,3 +423,38 @@ func TestFullSyncRetriesAfterFailure(t *testing.T) {
 	f.setFail(nil)
 	eventually(t, "retry succeeded", func() bool { st, _ := s.Status(ctx, "up"); return st.Items == 10 && st.LastError == "" })
 }
+
+func TestLibraryScanFinishTriggersFullSync(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	f := library()
+	startSyncer(t, s, f, SyncerOptions{Debounce: 10 * time.Millisecond})
+
+	// An artwork-only change: no LibraryChanged, but the scan's progress
+	// reaches 100 for the library.
+	f.rename("m6", "New artwork, same item")
+	msg := func(item, progress string) {
+		f.emit(upstream.Event{Upstream: "up", Type: upstream.EventMessage, MessageType: "RefreshProgress",
+			Data: json.RawMessage(`{"ItemId":"` + item + `","Progress":"` + progress + `"}`)})
+	}
+	msg("vMovies", "40")
+	msg("m1", "100") // not a library: ignored
+	time.Sleep(50 * time.Millisecond)
+	if st, _ := s.Status(ctx, "up"); st.Generation != 1 {
+		t.Fatalf("resynced on a non-final or non-library progress message (generation %d)", st.Generation)
+	}
+	msg("vMovies", "100")
+	eventually(t, "resync after scan", func() bool { it, _ := s.Item(ctx, "up", "m6"); return it != nil && it.Name == "New artwork, same item" })
+
+	// Jellyfin reports completion for a library's physical root folder, a
+	// Folder whose parent is not indexed.
+	f.addItem("vMovies", "rootfolder", "Folder", "movies")
+	f.mu.Lock()
+	f.items["rootfolder"]["ParentId"] = "aggregate-root"
+	f.mu.Unlock()
+	f.emit(upstream.Event{Upstream: "up", Type: upstream.EventConnected}) // reconnect -> resync learns the root
+	eventually(t, "root folder indexed", func() bool { it, _ := s.Item(ctx, "up", "rootfolder"); return it != nil })
+	f.rename("m5", "Changed during scan")
+	msg("rootfolder", "100")
+	eventually(t, "resync after root folder scan", func() bool { it, _ := s.Item(ctx, "up", "m5"); return it != nil && it.Name == "Changed during scan" })
+}

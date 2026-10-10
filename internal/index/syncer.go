@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -60,6 +61,14 @@ type Syncer struct {
 	fullReq   chan struct{}
 	changes   chan *upstream.LibraryChange
 	connected atomic.Bool
+	roots     atomic.Pointer[map[string]bool] // upstream library and library root folder IDs
+}
+
+// isLibraryRoot reports whether id is a library, or a library's physical root
+// folder (Jellyfin reports scan progress for these).
+func (s *Syncer) isLibraryRoot(id string) bool {
+	m := s.roots.Load()
+	return m != nil && (*m)[strings.ToLower(strings.ReplaceAll(id, "-", ""))]
 }
 
 // NewSyncer creates a syncer for src writing into store.
@@ -113,6 +122,17 @@ func (s *Syncer) onEvent(e upstream.Event) {
 		}
 	case upstream.EventDisconnected:
 		s.log.Warn("upstream socket disconnected", "err", e.Err)
+	case upstream.EventMessage:
+		s.log.Debug("upstream message", "type", e.MessageType, "data", string(e.Data))
+		// A library finished scanning. Scans can change artwork and metadata
+		// without any LibraryChanged message, so resync.
+		if e.MessageType == "RefreshProgress" {
+			var p struct{ ItemId, Progress string }
+			if json.Unmarshal(e.Data, &p) == nil && p.Progress == "100" && s.isLibraryRoot(p.ItemId) {
+				s.log.Debug("library scan finished; resyncing", "library", p.ItemId)
+				s.RequestFullSync()
+			}
+		}
 	case upstream.EventLibraryChanged:
 		select {
 		case s.changes <- e.Library:
@@ -223,11 +243,37 @@ func (s *Syncer) FullSync(ctx context.Context) (err error) {
 	if err := fs.PutViews(ctx, kept); err != nil {
 		return err
 	}
+	norm := func(id string) string { return strings.ToLower(strings.ReplaceAll(id, "-", "")) }
+	roots := map[string]bool{}
+	for _, h := range headers {
+		roots[norm(h.Id)] = true
+	}
+	// Folders whose parent is not indexed are library root folders.
+	seen := map[string]bool{}
+	folders := map[string]string{} // folder -> parent
+	defer func() {
+		if err == nil {
+			for f, parent := range folders {
+				if !seen[parent] {
+					roots[f] = true
+				}
+			}
+			s.roots.Store(&roots)
+		}
+	}()
 
 	items := 0
 	for _, v := range headers {
 		put := func(p *upstream.QueryResult) error {
 			items += len(p.Items)
+			for _, raw := range p.Items {
+				if h, err := parseHeader(raw); err == nil {
+					seen[norm(h.Id)] = true
+					if h.Type == "Folder" {
+						folders[norm(h.Id)] = norm(h.ParentId)
+					}
+				}
+			}
 			return fs.PutItems(ctx, v.Id, p.Items)
 		}
 		q := upstream.ItemsQuery{

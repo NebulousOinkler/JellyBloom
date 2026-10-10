@@ -40,6 +40,9 @@ func main() {
 
 	path := flag.String("config", "config.yaml", "path to config file")
 	flag.Parse()
+	if strings.EqualFold(os.Getenv("JELLYBLOOM_LOG"), "debug") {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	}
 
 	if err := run(*path); err != nil {
 		slog.Error("fatal", "err", err)

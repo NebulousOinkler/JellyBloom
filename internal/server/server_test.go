@@ -141,16 +141,21 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 			for k, v := range ms {
 				c[k] = v
 			}
-			c["TranscodingUrl"] = fmt.Sprintf("/videos/%s/master.m3u8?DeviceId=%s&MediaSourceId=%s&PlaySessionId=%s&api_key=%s",
+			c["TranscodingUrl"] = fmt.Sprintf("/videos/%s/master.m3u8?DeviceId=%s&MediaSourceId=%s&PlaySessionId=%s&ApiKey=%s",
 				item, device, ms["Id"], hexID("9"+f.name), tok)
 			sources = append(sources, c)
 		}
 		writeJSON(w, map[string]any{"MediaSources": sources, "PlaySessionId": hexID("9" + f.name)})
 		return
 	case strings.HasSuffix(r.URL.Path, "/master.m3u8"):
+		// Like Jellyfin, variant URLs carry the request's own ApiKey, if any.
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		fmt.Fprintf(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nmain.m3u8?DeviceId=%s&MediaSourceId=%s&PlaySessionId=%s&api_key=%s\n",
-			q.Get("DeviceId"), q.Get("MediaSourceId"), q.Get("PlaySessionId"), tok)
+		key := ""
+		if k := q.Get("ApiKey"); k != "" {
+			key = "&ApiKey=" + k
+		}
+		fmt.Fprintf(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nmain.m3u8?DeviceId=%s&MediaSourceId=%s&PlaySessionId=%s%s\n",
+			q.Get("DeviceId"), q.Get("MediaSourceId"), q.Get("PlaySessionId"), key)
 		return
 	case strings.Contains(r.URL.Path, "/hls1/"):
 		w.Header().Set("Content-Type", "video/mp4")
@@ -809,7 +814,7 @@ func TestPlayback(t *testing.T) {
 	tu, _ := url.Parse(v1080["TranscodingUrl"].(string))
 	tq := tu.Query()
 	if tu.Path != "/videos/"+item+"/master.m3u8" || tq.Get("MediaSourceId") != v1080["Id"] || tq.Get("PlaySessionId") != psid ||
-		tq.Get("api_key") != e.token || tq.Get("DeviceId") != "dev1" {
+		tq.Get("ApiKey") != e.token || tq.Get("DeviceId") != "dev1" {
 		t.Errorf("TranscodingUrl = %s", tu)
 	}
 
@@ -827,8 +832,11 @@ func TestPlayback(t *testing.T) {
 	if !strings.Contains(got.auth, `DeviceId="`+upstream.DeviceID("a", e.userID, "dev1")+`"`) {
 		t.Errorf("upstream auth device = %s", got.auth)
 	}
+	if k := got.query.Get("ApiKey"); k == "" || k == e.token {
+		t.Errorf("upstream got ApiKey %q: want its own token, never the client's", k)
+	}
 	body := string(pl.body)
-	if !strings.Contains(body, "PlaySessionId="+psid) || !strings.Contains(body, "api_key="+e.token) ||
+	if !strings.Contains(body, "PlaySessionId="+psid) || !strings.Contains(body, "ApiKey="+e.token) ||
 		!strings.Contains(body, "DeviceId=dev1") || strings.Contains(body, hexID("9a")) || strings.Contains(body, shared["a"]) {
 		t.Errorf("playlist not rewritten: %s", body)
 	}
