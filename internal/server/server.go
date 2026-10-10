@@ -97,10 +97,15 @@ func (s *Server) routes() {
 	rt.handle(http.MethodGet, "/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "web/", http.StatusFound)
 	})
-	rt.handle(http.MethodGet, "/web", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/web/", http.StatusFound)
+	// The router ignores trailing slashes, so "/web" and "/web/" both land
+	// here: only the bare form redirects (redirecting "/web/" would loop).
+	rt.handle("", "/web/{rest...}", func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/") && r.PathValue("rest") == "" {
+			http.Redirect(w, r, "/web/", http.StatusFound)
+			return
+		}
+		s.proxy.Web(w, r)
 	})
-	rt.handle("", "/web/{rest...}", s.proxy.Web)
 
 	rt.handle(http.MethodGet, "/System/Info/Public", s.publicInfo)
 	rt.handle(http.MethodGet, "/System/Info", s.authed(s.systemInfo))

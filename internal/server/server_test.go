@@ -579,6 +579,12 @@ func TestWebProxy(t *testing.T) {
 	if r := e.do("GET", "/", "", nil); r.code != 302 || r.header.Get("Location") != "/web/" {
 		t.Errorf("root = %d %s", r.code, r.header.Get("Location"))
 	}
+	if r := e.do("GET", "/web", "", nil); r.code != 302 || r.header.Get("Location") != "/web/" {
+		t.Errorf("/web = %d %s", r.code, r.header.Get("Location"))
+	}
+	if r := e.do("GET", "/web/", "", nil); r.code != 200 {
+		t.Errorf("/web/ = %d %s, want the web UI (not a redirect loop)", r.code, r.header.Get("Location"))
+	}
 	r := e.do("GET", "/web/index.html", "", nil)
 	if r.code != 200 || string(r.body) != "<html>web from b "+aOnly+"</html>" {
 		t.Errorf("web = %d %q (must come unmodified from web_upstream b)", r.code, r.body)
