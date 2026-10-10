@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/NebulousOinkler/JellyBloom/internal/auth"
+	"github.com/NebulousOinkler/JellyBloom/internal/catalog"
 	"github.com/NebulousOinkler/JellyBloom/internal/proxy"
 )
 
@@ -46,6 +47,7 @@ type Options struct {
 	DB         *sql.DB
 	Auth       *auth.Service
 	Proxy      *proxy.Proxy
+	Catalog    *catalog.Catalog
 	// Version reports the web upstream's Jellyfin version. JellyBloom claims
 	// the same version so the jellyfin-web it serves sees a matching server.
 	Version func(ctx context.Context) (string, error)
@@ -54,13 +56,14 @@ type Options struct {
 
 // Server is the client-facing HTTP handler.
 type Server struct {
-	opts   Options
-	db     *sql.DB
-	auth   *auth.Service
-	proxy  *proxy.Proxy
-	hub    *hub
-	log    *slog.Logger
-	router *router
+	opts    Options
+	db      *sql.DB
+	auth    *auth.Service
+	proxy   *proxy.Proxy
+	catalog *catalog.Catalog
+	hub     *hub
+	log     *slog.Logger
+	router  *router
 
 	mu        sync.Mutex
 	version   string
@@ -75,7 +78,7 @@ func New(o Options) (*Server, error) {
 	if _, err := o.DB.Exec(schema); err != nil {
 		return nil, err
 	}
-	s := &Server{opts: o, db: o.DB, auth: o.Auth, proxy: o.Proxy, hub: newHub(o.Logger), log: o.Logger}
+	s := &Server{opts: o, db: o.DB, auth: o.Auth, proxy: o.Proxy, catalog: o.Catalog, hub: newHub(o.Logger), log: o.Logger}
 	s.routes()
 	return s, nil
 }
@@ -147,6 +150,8 @@ func (s *Server) routes() {
 	rt.handle(http.MethodGet, "/socket", s.authed(func(w http.ResponseWriter, r *http.Request, c *caller) {
 		s.hub.serve(w, r, c.user.ID)
 	}))
+
+	s.browseRoutes(rt)
 }
 
 // caller is an authenticated request's session.

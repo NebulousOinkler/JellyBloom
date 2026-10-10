@@ -48,12 +48,18 @@ CREATE TABLE IF NOT EXISTS mappings (
 );
 CREATE INDEX IF NOT EXISTS mappings_unified ON mappings (unified_id);
 
--- IDs minted on the fly for upstream GUIDs that are not indexed items.
+-- IDs for upstream GUIDs that are not indexed items: minted on the fly, or
+-- set as aliases for synthesized objects (merged libraries, genres, people).
+-- An alias may cover several upstream objects (one merged library on two
+-- servers); requests route to the lowest rank.
 CREATE TABLE IF NOT EXISTS lazy_mappings (
-	unified_id TEXT PRIMARY KEY,
 	upstream   TEXT NOT NULL,
-	real_id    TEXT NOT NULL
+	real_id    TEXT NOT NULL,
+	unified_id TEXT NOT NULL,
+	rank       INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (upstream, real_id)
 );
+CREATE INDEX IF NOT EXISTS lazy_mappings_unified ON lazy_mappings (unified_id, rank);
 `
 
 // Op is a set operation over upstreams.
@@ -82,7 +88,13 @@ type Resolver struct {
 	log    *slog.Logger
 	notify chan struct{}
 	mu     sync.Mutex // serializes rebuilds
+
+	onRebuild func(context.Context)
 }
+
+// OnRebuild registers fn to run after every successful rebuild (e.g. to
+// refresh the catalog). Call before Run.
+func (r *Resolver) OnRebuild(fn func(context.Context)) { r.onRebuild = fn }
 
 // New creates a resolver over idx, creating its tables if needed.
 func New(idx *index.Store, mode Mode, logger *slog.Logger) (*Resolver, error) {
@@ -195,6 +207,9 @@ func (r *Resolver) Rebuild(ctx context.Context) (Stats, error) {
 	}
 	r.log.Info("identity rebuilt", "items", stats.Items, "unified", stats.Unified, "merged", stats.Merged,
 		"visible", stats.Visible, "op", r.mode.Op, "took", time.Since(start).Round(time.Millisecond))
+	if r.onRebuild != nil {
+		r.onRebuild(ctx)
+	}
 	return stats, nil
 }
 
@@ -697,16 +712,25 @@ func (r *Resolver) Lookup(ctx context.Context, id string) (*Unified, error) {
 	u := &Unified{ID: id}
 	err := r.db.QueryRowContext(ctx, `SELECT type, visible FROM unified_items WHERE unified_id = ?`, id).Scan(&u.Type, &u.Visible)
 	if errors.Is(err, sql.ErrNoRows) {
-		var rf Ref
-		err := r.db.QueryRowContext(ctx, `SELECT upstream, real_id FROM lazy_mappings WHERE unified_id = ?`, id).Scan(&rf.Upstream, &rf.ID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
+		rows, err := r.db.QueryContext(ctx, `SELECT upstream, real_id FROM lazy_mappings WHERE unified_id = ? ORDER BY rank`, id)
 		if err != nil {
 			return nil, err
 		}
-		rf.Source = true
-		u.Lazy, u.Visible, u.Refs = true, true, []Ref{rf}
+		defer rows.Close()
+		for rows.Next() {
+			rf := Ref{Source: true}
+			if err := rows.Scan(&rf.Upstream, &rf.ID); err != nil {
+				return nil, err
+			}
+			u.Refs = append(u.Refs, rf)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		if len(u.Refs) == 0 {
+			return nil, ErrNotFound
+		}
+		u.Lazy, u.Visible = true, true
 		return u, nil
 	}
 	if err != nil {
@@ -740,7 +764,55 @@ func (r *Resolver) UnifiedID(ctx context.Context, upstream, realID string) (stri
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
+	err = r.db.QueryRowContext(ctx, `SELECT unified_id FROM lazy_mappings WHERE upstream = ? AND real_id = ?`,
+		upstream, realID).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
 	id = newID("lazy:" + upstream + ":" + realID)
-	_, err = r.db.ExecContext(ctx, `INSERT OR IGNORE INTO lazy_mappings (unified_id, upstream, real_id) VALUES (?, ?, ?)`, id, upstream, realID)
+	_, err = r.db.ExecContext(ctx, `INSERT OR IGNORE INTO lazy_mappings (upstream, real_id, unified_id) VALUES (?, ?, ?)`, upstream, realID, id)
 	return id, err
+}
+
+// Alias points a synthesized ID at the upstream objects it stands for, so
+// requests naming it (e.g. for images) route to the first, and responses
+// mentioning any of them show the synthesized ID.
+type Alias struct {
+	ID   string
+	Refs []Ref // routing preference order
+}
+
+// SetAliases records aliases, replacing earlier mappings of the same
+// synthesized IDs or upstream objects.
+func (r *Resolver) SetAliases(ctx context.Context, aliases []Alias) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	delID, err := tx.PrepareContext(ctx, `DELETE FROM lazy_mappings WHERE unified_id = ?`)
+	if err != nil {
+		return err
+	}
+	defer delID.Close()
+	upsert, err := tx.PrepareContext(ctx, `INSERT INTO lazy_mappings (upstream, real_id, unified_id, rank) VALUES (?, ?, ?, ?)
+		ON CONFLICT (upstream, real_id) DO UPDATE SET unified_id = excluded.unified_id, rank = excluded.rank`)
+	if err != nil {
+		return err
+	}
+	defer upsert.Close()
+	for _, a := range aliases {
+		if _, err := delID.ExecContext(ctx, a.ID); err != nil {
+			return err
+		}
+		for i, rf := range a.Refs {
+			if _, err := upsert.ExecContext(ctx, rf.Upstream, NormalizeID(rf.ID), a.ID, i); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }

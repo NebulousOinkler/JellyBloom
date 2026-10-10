@@ -20,6 +20,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/NebulousOinkler/JellyBloom/internal/auth"
+	"github.com/NebulousOinkler/JellyBloom/internal/catalog"
 	"github.com/NebulousOinkler/JellyBloom/internal/config"
 	"github.com/NebulousOinkler/JellyBloom/internal/identity"
 	"github.com/NebulousOinkler/JellyBloom/internal/index"
@@ -100,6 +101,10 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("BYTES " + aOnly + " " + tok))
 		return
 	}
+	if r.URL.Query().Get("list") == "1" {
+		writeJSON(w, map[string]any{"Items": []map[string]any{{"Id": shared[f.name]}, {"Id": aOnly}, {"Id": bOnly}}, "TotalRecordCount": 3})
+		return
+	}
 	writeJSON(w, map[string]any{
 		"Upstream":  f.name,
 		"Path":      r.URL.Path,
@@ -137,7 +142,32 @@ type env struct {
 	serverID string
 }
 
-func newEnv(t *testing.T, mode identity.Mode) *env {
+// library is one upstream's indexed content: libraries and their items.
+type library struct {
+	views []map[string]any
+	items map[string][]map[string]any // view ID -> items
+}
+
+var defaultData = map[string]library{
+	"a": {
+		views: []map[string]any{{"Id": hexID("va"), "Name": "Movies", "CollectionType": "movies"}},
+		items: map[string][]map[string]any{hexID("va"): {
+			{"Id": shared["a"], "Type": "Movie", "Name": "Shared", "ParentId": hexID("va"), "ProviderIds": map[string]string{"Tmdb": "1"}},
+			{"Id": aOnly, "Type": "Movie", "Name": "A", "ParentId": hexID("va"), "ProviderIds": map[string]string{"Tmdb": "2"}},
+		}},
+	},
+	"b": {
+		views: []map[string]any{{"Id": hexID("vb"), "Name": "Movies", "CollectionType": "movies"}},
+		items: map[string][]map[string]any{hexID("vb"): {
+			{"Id": shared["b"], "Type": "Movie", "Name": "Shared", "ParentId": hexID("vb"), "ProviderIds": map[string]string{"Tmdb": "1"}},
+			{"Id": bOnly, "Type": "Movie", "Name": "B", "ParentId": hexID("vb"), "ProviderIds": map[string]string{"Tmdb": "3"}},
+		}},
+	},
+}
+
+func newEnv(t *testing.T, mode identity.Mode) *env { return newEnvWith(t, mode, defaultData) }
+
+func newEnvWith(t *testing.T, mode identity.Mode, data map[string]library) *env {
 	t.Helper()
 	ctx := context.Background()
 	idx, err := index.Open(filepath.Join(t.TempDir(), "db"))
@@ -147,21 +177,23 @@ func newEnv(t *testing.T, mode identity.Mode) *env {
 	t.Cleanup(func() { idx.Close() })
 
 	e := &env{t: t, a: newFakeUpstream(t, "a"), b: newFakeUpstream(t, "b")}
-	movies := map[string][]map[string]any{
-		"a": {{"Id": shared["a"], "Type": "Movie", "Name": "Shared", "ProviderIds": map[string]string{"Tmdb": "1"}},
-			{"Id": aOnly, "Type": "Movie", "Name": "A", "ProviderIds": map[string]string{"Tmdb": "2"}}},
-		"b": {{"Id": shared["b"], "Type": "Movie", "Name": "Shared", "ProviderIds": map[string]string{"Tmdb": "1"}},
-			{"Id": bOnly, "Type": "Movie", "Name": "B", "ProviderIds": map[string]string{"Tmdb": "3"}}},
-	}
-	for up, items := range movies {
-		fs, _ := idx.BeginFullSync(ctx, up)
-		var raws []json.RawMessage
-		for _, it := range items {
-			b, _ := json.Marshal(it)
-			raws = append(raws, b)
+	raws := func(ds []map[string]any) []json.RawMessage {
+		var out []json.RawMessage
+		for _, d := range ds {
+			b, _ := json.Marshal(d)
+			out = append(out, b)
 		}
-		if err := fs.PutItems(ctx, "v", raws); err != nil {
+		return out
+	}
+	for up, lib := range data {
+		fs, _ := idx.BeginFullSync(ctx, up)
+		if err := fs.PutViews(ctx, raws(lib.views)); err != nil {
 			t.Fatal(err)
+		}
+		for v, items := range lib.items {
+			if err := fs.PutItems(ctx, v, raws(items)); err != nil {
+				t.Fatal(err)
+			}
 		}
 		fs.Commit(ctx)
 	}
@@ -170,9 +202,6 @@ func newEnv(t *testing.T, mode identity.Mode) *env {
 		mode.Op = identity.Union
 	}
 	if e.res, err = identity.New(idx, mode, nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := e.res.Rebuild(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -188,12 +217,24 @@ func newEnv(t *testing.T, mode identity.Mode) *env {
 		}
 		clients = append(clients, c)
 	}
+	var cat *catalog.Catalog
 	policy, _ := proxy.NewPolicy(nil)
-	px, err := proxy.New(proxy.Options{Upstreams: clients, WebUpstream: "b", Resolver: e.res, ServerID: e.auth.ServerID(), Policy: policy})
+	px, err := proxy.New(proxy.Options{Upstreams: clients, WebUpstream: "b", Resolver: e.res, ServerID: e.auth.ServerID(),
+		Policy: policy, Hidden: func(id string) bool { return cat.Hidden(id) }})
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.server, err = New(Options{ServerName: "Bloom", DB: idx.DB(), Auth: e.auth, Proxy: px,
+	cat = catalog.New(catalog.Options{DB: idx.DB(), Resolver: e.res, Upstreams: []string{"a", "b"},
+		ServerID: e.auth.ServerID(), UpstreamIDs: px.UpstreamIDs})
+	e.res.OnRebuild(func(ctx context.Context) {
+		if err := cat.Reload(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := e.res.Rebuild(ctx); err != nil {
+		t.Fatal(err)
+	}
+	e.server, err = New(Options{ServerName: "Bloom", DB: idx.DB(), Auth: e.auth, Proxy: px, Catalog: cat,
 		Version: func(ctx context.Context) (string, error) {
 			info, err := clients[1].PublicInfo(ctx)
 			if err != nil {
@@ -526,5 +567,118 @@ func TestRouterCaseInsensitive(t *testing.T) {
 	rt.ServeHTTP(rec, httptest.NewRequest("POST", "/Users/x/Items", nil))
 	if rec.Code != 404 {
 		t.Errorf("wrong method should reach fallback, got %d", rec.Code)
+	}
+}
+
+func TestFallbackListsDropHiddenItems(t *testing.T) {
+	e := newEnv(t, identity.Mode{Op: identity.Difference, Base: "a", Subtract: []string{"b"}})
+	e.login()
+	got := e.do("GET", "/Items/"+e.uid("a", aOnly)+"/Similar?list=1", e.token, nil).json(t)
+	items := got["Items"].([]any)
+	if len(items) != 2 || got["TotalRecordCount"] != float64(2) {
+		t.Fatalf("list = %v", got)
+	}
+	for _, it := range items {
+		if id := it.(map[string]any)["Id"]; id == e.uid("a", shared["a"]) {
+			t.Errorf("hidden shared item leaked through fallback list: %v", got)
+		}
+	}
+}
+
+// TestMilestoneMusicAndVideo is phase 5's milestone: a music-only upstream and
+// a video-only upstream browse as one server.
+func TestMilestoneMusicAndVideo(t *testing.T) {
+	music, movies := hexID("a0"), hexID("b0")
+	artistID, albumID, trackID, movieID := hexID("a3"), hexID("a4"), hexID("a5"), hexID("b3")
+	e := newEnvWith(t, identity.Mode{}, map[string]library{
+		"a": {
+			views: []map[string]any{{"Id": music, "Name": "Music", "CollectionType": "music", "ImageTags": map[string]string{"Primary": tagHex}}},
+			items: map[string][]map[string]any{music: {
+				{"Id": artistID, "Type": "MusicArtist", "Name": "Björk", "IsFolder": true},
+				{"Id": albumID, "Type": "MusicAlbum", "Name": "Homogenic", "IsFolder": true, "ParentId": music,
+					"AlbumArtists": []map[string]string{{"Name": "Björk", "Id": artistID}}, "AlbumArtist": "Björk"},
+				{"Id": trackID, "Type": "Audio", "Name": "Hunter", "ParentId": albumID, "AlbumId": albumID, "IndexNumber": 1, "MediaType": "Audio"},
+			}},
+		},
+		"b": {
+			views: []map[string]any{{"Id": movies, "Name": "Movies", "CollectionType": "movies"}},
+			items: map[string][]map[string]any{movies: {
+				{"Id": movieID, "Type": "Movie", "Name": "Alien", "ParentId": movies, "Overview": "In space", "ProductionYear": 1979,
+					"ImageTags": map[string]string{"Primary": tagHex}, "ProviderIds": map[string]string{"Tmdb": "348"}, "MediaType": "Video"},
+			}},
+		},
+	})
+	e.login()
+
+	views := e.do("GET", "/UserViews?userId="+e.userID, e.token, nil).json(t)["Items"].([]any)
+	if len(views) != 2 {
+		t.Fatalf("views = %v", views)
+	}
+	byName := map[string]map[string]any{}
+	for _, v := range views {
+		m := v.(map[string]any)
+		byName[m["Name"].(string)] = m
+	}
+	musicView, movieView := byName["Music"], byName["Movies"]
+	if musicView["CollectionType"] != "music" || movieView["CollectionType"] != "movies" {
+		t.Fatalf("views = %v", views)
+	}
+	if r := e.do("GET", "/Users/"+e.userID+"/Views", e.token, nil).json(t); len(r["Items"].([]any)) != 2 {
+		t.Error("legacy /Users/{id}/Views")
+	}
+	if r := e.do("GET", "/Items", e.token, nil).json(t); len(r["Items"].([]any)) != 2 {
+		t.Error("/Items with no parent should list the libraries")
+	}
+
+	albums := e.do("GET", "/Users/"+e.userID+"/Items?ParentId="+musicView["Id"].(string)+"&Recursive=true&IncludeItemTypes=MusicAlbum", e.token, nil)
+	al := albums.json(t)["Items"].([]any)
+	if len(al) != 1 || al[0].(map[string]any)["Name"] != "Homogenic" || al[0].(map[string]any)["Id"] != e.uid("a", albumID) {
+		t.Errorf("albums = %s", albums.body)
+	}
+
+	list := e.do("GET", "/Items?parentId="+movieView["Id"].(string)+"&recursive=true&includeItemTypes=Movie&fields=Overview", e.token, nil)
+	mv := list.json(t)["Items"].([]any)
+	if len(mv) != 1 || mv[0].(map[string]any)["Overview"] != "In space" {
+		t.Errorf("movies = %s", list.body)
+	}
+	for _, leak := range []string{movieID, movies, albumID, music} {
+		if bytes.Contains(list.body, []byte(leak)) || bytes.Contains(albums.body, []byte(leak)) {
+			t.Errorf("upstream id %s leaked", leak)
+		}
+	}
+
+	movie := e.uid("b", movieID)
+	detail := e.do("GET", "/Users/"+e.userID+"/Items/"+movie, e.token, nil).json(t)
+	if detail["ParentId"] != movieView["Id"] || detail["ProductionYear"] != float64(1979) {
+		t.Errorf("detail = %v", detail)
+	}
+
+	// Artwork routes to the upstream that has it, for items and libraries.
+	e.do("GET", "/Items/"+movie+"/Images/Primary?tag="+tagHex, "", nil)
+	if req, _ := e.b.lastRequest(); req.URL.Path != "/Items/"+movieID+"/Images/Primary" || req.URL.Query().Get("tag") != tagHex {
+		t.Errorf("movie image went to %s?%s", req.URL.Path, req.URL.RawQuery)
+	}
+	e.do("GET", "/Items/"+musicView["Id"].(string)+"/Images/Primary", "", nil)
+	if req, _ := e.a.lastRequest(); req.URL.Path != "/Items/"+music+"/Images/Primary" {
+		t.Errorf("library image went to %s", req.URL.Path)
+	}
+
+	artists := e.do("GET", "/Artists/AlbumArtists?parentId="+musicView["Id"].(string), e.token, nil).json(t)["Items"].([]any)
+	if len(artists) != 1 || artists[0].(map[string]any)["Name"] != "Björk" {
+		t.Errorf("album artists = %v", artists)
+	}
+	hints := e.do("GET", "/Search/Hints?searchTerm=hunt", e.token, nil).json(t)["SearchHints"].([]any)
+	if len(hints) != 1 || hints[0].(map[string]any)["Name"] != "Hunter" {
+		t.Errorf("hints = %v", hints)
+	}
+	latest := e.do("GET", "/Items/Latest?parentId="+musicView["Id"].(string), e.token, nil)
+	if !strings.Contains(string(latest.body), "Homogenic") {
+		t.Errorf("latest music (grouped by album) = %s", latest.body)
+	}
+	if r := e.do("GET", "/Items/"+hexID("dead"), e.token, nil); r.code != 404 {
+		t.Errorf("unknown item = %d", r.code)
+	}
+	if r := e.do("GET", "/Users/"+hexID("99")+"/Items", e.token, nil); r.code != 403 {
+		t.Errorf("other user's items = %d", r.code)
 	}
 }

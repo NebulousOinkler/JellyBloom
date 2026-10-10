@@ -67,13 +67,22 @@ with the "done when" check from that table. Target upstream version: Jellyfin 10
   only; phase 5 replaces them with merged answers from the index.
 
 ## Phase 5: Browse, union only (`internal/api`)
-- [ ] `/UserViews` synthesized by `CollectionType`
-- [ ] `/Items`: filters, `SortBy`, paging, `Recursive`, `IncludeItemTypes`, `searchTerm`
-- [ ] `/Items/{id}`, `/Items/Latest`, `/Items/Filters`, `/Search/Hints`
-- [ ] `/Artists`, `/Genres`, `/Studios`, `/Persons`, `/Shows/{id}/Seasons|Episodes`
-- [ ] Image relay (cache headers passed through)
-- [ ] `Fields=` trimming and a `UserData` overlay stub
-- [ ] **Milestone:** a music-only and a video-only upstream browse as one server in jellyfin-web
+- [x] `/UserViews` synthesized by `CollectionType`
+- [x] `/Items`: filters, `SortBy`, paging, `Recursive`, `IncludeItemTypes`, `searchTerm`
+- [x] `/Items/{id}`, `/Items/Latest`, `/Items/Filters`, `/Search/Hints`
+- [x] `/Artists`, `/Genres`, `/Studios`, `/Persons`, `/Shows/{id}/Seasons|Episodes`
+- [x] Image relay (cache headers passed through)
+- [x] `Fields=` trimming and a `UserData` overlay stub
+- [x] **Milestone (against fake upstreams):** a music-only and a video-only upstream browse as one server
+- [ ] **Milestone (real):** verify in jellyfin-web against two real Jellyfin servers
+- Libraries merge by collection type + folded name ("Movies" on two servers → one; "Kids
+  Movies" stays separate); libraries whose items are all hidden are omitted.
+- Genres, studios, people, and libraries get derived IDs aliased to every upstream copy, so
+  artwork routes to the first and responses from any upstream show the merged ID.
+- Merged DTOs: preferred upstream (config order) wins; empty fields filled from other copies;
+  ChildCount/RecursiveItemCount recomputed over the merged tree; upstream UserData replaced.
+- Fallback list responses drop items hidden by the set operation.
+- Benchmarks (50k copies): catalog reload ~0.5 s; 100-item page ~15 ms.
 
 ## Phase 6: Playback (`internal/playback`)
 - [ ] `PlaybackInfo`: fan out to every source, group copies into versions, rank, assign unified `MediaSource.Id`s

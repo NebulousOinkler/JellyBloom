@@ -210,3 +210,7 @@ func (it *item) parents() []string {
 	}
 	return out
 }
+
+// NormTitle folds a name for matching and search: accent-free lowercase
+// letters and digits only.
+func NormTitle(s string) string { return normTitle(s) }

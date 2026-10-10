@@ -19,6 +19,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/NebulousOinkler/JellyBloom/internal/auth"
+	"github.com/NebulousOinkler/JellyBloom/internal/catalog"
 	"github.com/NebulousOinkler/JellyBloom/internal/config"
 	"github.com/NebulousOinkler/JellyBloom/internal/identity"
 	"github.com/NebulousOinkler/JellyBloom/internal/index"
@@ -111,11 +112,6 @@ func run(configPath string) error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		resolver.Run(ctx, time.Second)
-	}()
 	var clients []*upstream.Client
 	var web *upstream.Client
 	for _, u := range cfg.Upstreams {
@@ -139,21 +135,42 @@ func run(configPath string) error {
 	if err != nil {
 		return err
 	}
+	var cat *catalog.Catalog
 	px, err := proxy.New(proxy.Options{
 		Upstreams:   clients,
 		WebUpstream: cfg.WebUpstream,
 		Resolver:    resolver,
 		ServerID:    authSvc.ServerID(),
 		Policy:      policy,
+		Hidden:      func(id string) bool { return cat.Hidden(id) },
 	})
 	if err != nil {
 		return err
 	}
+	cat = catalog.New(catalog.Options{
+		DB:          store.DB(),
+		Resolver:    resolver,
+		Upstreams:   names,
+		ServerID:    authSvc.ServerID(),
+		UpstreamIDs: px.UpstreamIDs,
+	})
+	resolver.OnRebuild(func(ctx context.Context) {
+		if err := cat.Reload(ctx); err != nil {
+			slog.Error("catalog reload failed", "err", err)
+		}
+	})
+	// Start rebuilding only once the catalog hook is registered.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resolver.Run(ctx, time.Second)
+	}()
 	srv, err := server.New(server.Options{
 		ServerName: cfg.ServerName,
 		DB:         store.DB(),
 		Auth:       authSvc,
 		Proxy:      px,
+		Catalog:    cat,
 		Version: func(ctx context.Context) (string, error) {
 			info, err := web.PublicInfo(ctx)
 			if err != nil {

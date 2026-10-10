@@ -119,6 +119,10 @@ func (r *Replacer) JSON(b []byte) []byte {
 	return bytes.TrimSuffix(out.Bytes(), []byte("\n"))
 }
 
+// Value rewrites a decoded JSON value in place (as decoded with UseNumber),
+// with the same rules as JSON.
+func (r *Replacer) Value(v any) any { return r.walk(v) }
+
 func (r *Replacer) walk(v any) any {
 	switch t := v.(type) {
 	case string:

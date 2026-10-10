@@ -6,6 +6,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -50,7 +51,10 @@ type Options struct {
 	ServerID    string // JellyBloom's server ID
 	Policy      *Policy
 	Transport   http.RoundTripper // default: tuned http.Transport
-	Logger      *slog.Logger
+	// Hidden reports unified IDs hidden by the set operation; list entries
+	// for them are dropped from forwarded responses.
+	Hidden func(id string) bool
+	Logger *slog.Logger
 }
 
 // Proxy forwards requests to upstreams. It is safe for concurrent use.
@@ -61,6 +65,7 @@ type Proxy struct {
 	res      Resolver
 	serverID string
 	policy   *Policy
+	hidden   func(string) bool
 	hc       *http.Client
 	log      *slog.Logger
 
@@ -90,7 +95,7 @@ func New(o Options) (*Proxy, error) {
 	}
 	p := &Proxy{
 		ups: o.Upstreams, byName: map[string]*upstream.Client{}, res: o.Resolver, serverID: o.ServerID,
-		policy: o.Policy, log: o.Logger, serverIDs: map[string]string{}, seen: map[string]bool{},
+		policy: o.Policy, hidden: o.Hidden, log: o.Logger, serverIDs: map[string]string{}, seen: map[string]bool{},
 		// No overall timeout: media streams last as long as playback.
 		hc: &http.Client{Transport: o.Transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 	}
@@ -109,6 +114,17 @@ func New(o Options) (*Proxy, error) {
 
 // Decide exposes the fallback policy so the server can authenticate first.
 func (p *Proxy) Decide(r *http.Request) Decision { return p.policy.Decide(r.Method, r.URL.Path) }
+
+// UpstreamIDs returns the user and server IDs JellyBloom has on an upstream
+// ("" when unavailable).
+func (p *Proxy) UpstreamIDs(ctx context.Context, name string) (userID, serverID string) {
+	up := p.byName[name]
+	if up == nil {
+		return "", ""
+	}
+	_, userID, _ = up.Session(ctx)
+	return userID, p.upstreamServerID(ctx, up)
+}
 
 // upstreamServerID returns (and caches) an upstream's server ID.
 func (p *Proxy) upstreamServerID(ctx context.Context, up *upstream.Client) string {
@@ -434,7 +450,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, up *upstream.Cli
 	}
 	out := rep.Text(raw)
 	if rewrite.IsJSON(ct) {
-		out = rep.JSON(raw)
+		out = p.dropHidden(rep.JSON(raw))
 	}
 	h := w.Header()
 	for _, k := range []string{"Content-Length", "Etag", "Content-Md5", "Accept-Ranges", "Content-Range"} {
@@ -507,4 +523,68 @@ func (p *Proxy) logRoute(r *http.Request, up *upstream.Client, c Caller) {
 	if first {
 		p.log.Info("fallback route", "route", key, "upstream", up.Name(), "client", c.Client)
 	}
+}
+
+// dropHidden removes items hidden by the set operation from list responses
+// (a {"Items": [...]} envelope or a bare array of items), so fallback routes
+// such as /Items/{id}/Similar cannot reveal them.
+func (p *Proxy) dropHidden(body []byte) []byte {
+	if p.hidden == nil {
+		return body
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || (trimmed[0] != '{' && trimmed[0] != '[') {
+		return body
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var v any
+	if dec.Decode(&v) != nil {
+		return body
+	}
+	filter := func(list []any) ([]any, int) {
+		out := list[:0]
+		removed := 0
+		for _, e := range list {
+			if m, ok := e.(map[string]any); ok {
+				if id, ok := m["Id"].(string); ok && p.hidden(id) {
+					removed++
+					continue
+				}
+			}
+			out = append(out, e)
+		}
+		return out, removed
+	}
+	changed := false
+	switch t := v.(type) {
+	case []any:
+		var n int
+		if v, n = filter(t); n > 0 {
+			changed = true
+		}
+	case map[string]any:
+		if list, ok := t["Items"].([]any); ok {
+			kept, n := filter(list)
+			if n > 0 {
+				changed = true
+				t["Items"] = kept
+				if total, ok := t["TotalRecordCount"].(json.Number); ok {
+					if c, err := total.Int64(); err == nil {
+						t["TotalRecordCount"] = max(c-int64(n), 0)
+					}
+				}
+			}
+		}
+	}
+	if !changed {
+		return body
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if enc.Encode(v) != nil {
+		return body
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
 }

@@ -20,3 +20,7 @@ func newID(name string) string {
 	u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 variant
 	return hex.EncodeToString(u[:])
 }
+
+// DeriveID returns a stable JellyBloom ID for name, for synthesized objects
+// such as merged libraries, genres, and people.
+func DeriveID(name string) string { return newID("derived:" + name) }
