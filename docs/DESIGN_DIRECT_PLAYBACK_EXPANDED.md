@@ -182,4 +182,7 @@ Appendix: Example header-based fallback approach
 - When returning 302 for primary, include header: `X-JellyBloom-Fallback: https://jb.example/stream/fallback/abcd`.
 - Clients that ignore the header still get redirected and stream directly; clients that understand the header can prefetch or register the fallback URL for quick reconnect.
 
+References
+- Repository: https://github.com/NebulousOinkler/JellyBloom
+- Related concept: Jellyswarrm's direct-playback / minimal-overhead proxying goals and its sessions/WebSocket coordination work.
 
